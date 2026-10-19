@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "description": "Production-quality API abuse detection and protection middleware for Node.js & Express",
   "main": "src/index.js",
+  "bin": {
+    "z-shield": "src/cli.js"
+  },
   "scripts": {
     "test": "node --test test/*.test.js",
     "start": "node examples/express-app.js"
