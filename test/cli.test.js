@@ -15,7 +15,10 @@ const {
   readLogs,
   calculateStatus,
   resolveLogPath,
-  runCommand
+  runCommand,
+  sanitizeIp,
+  sanitizeType,
+  sanitizeAction
 } = require('../src/cli');
 const { stripAnsi } = require('../src/logger');
 
@@ -119,6 +122,125 @@ describe('Z-Shield Phase 5: CLI Commands & Architecture', () => {
       assert.equal(status.totalEvents, 3);
       assert.equal(status.topIps[0].ip, '1.1.1.1');
       assert.equal(status.topIps[0].count, 2);
+    });
+
+    test('sanitizes untrusted status fields before aggregation and terminal output', async () => {
+      const logFile = path.join(tempDir, 'events.jsonl');
+      const hostileEvent = {
+        ip: '203.0.113.8\u001b[31mINJECTED\u001b[0m',
+        route: '/api\nINJECTED\x7f',
+        type: 'rate_limit\r\nINJECTED',
+        action: 'warned\x1b[2JINJECTED',
+        reason: 'secret reason\u001b[HINJECTED',
+        severity: 'warning'
+      };
+      fs.writeFileSync(logFile, `${JSON.stringify(hostileEvent)}\n`, 'utf8');
+
+      const status = calculateStatus(logFile);
+      assert.deepEqual(Object.keys(status.typeCounts), ['rate_limit']);
+      assert.deepEqual(Object.keys(status.actionCounts), ['warned']);
+      assert.deepEqual(status.topIps.map(({ ip }) => ip), ['203.0.113.8']);
+      assert.deepEqual(status.topRoutes.map(({ route }) => route), ['/api']);
+
+      const logs = [];
+      const output = {
+        log: (message) => logs.push(String(message)),
+        error: () => {}
+      };
+      const code = await runCommand(['status', '--no-color', '--log-dir', tempDir], output);
+      assert.equal(code, 0);
+
+      const rendered = logs.join('\n');
+      assert.doesNotMatch(rendered, /[\x00-\x09\x0b-\x1f\x7f]/);
+      assert.doesNotMatch(rendered, /\x1b/);
+      assert.doesNotMatch(rendered, /INJECTED/);
+      assert.equal(rendered.includes('secret reason'), false);
+
+      const typeSummary = rendered.split('\n').filter((line) => line.includes('rate_limit'));
+      assert.equal(typeSummary.length, 1);
+      assert.match(typeSummary[0], /rate_limit: 1/);
+      const routeSummary = rendered.split('\n').filter((line) => line.includes('/api'));
+      assert.equal(routeSummary.length, 1);
+      assert.match(routeSummary[0], /\/api: 1 events/);
+      const ipSummary = rendered.split('\n').filter((line) => line.includes('203.0.113.8'));
+      assert.equal(ipSummary.length, 1);
+      assert.match(ipSummary[0], /203\.0\.113\.8: 1 events/);
+    });
+
+    test('prevents duplicate aggregation entries from newline splitting in untrusted fields', async () => {
+      const logFile = path.join(tempDir, 'events.jsonl');
+      const events = [
+        {
+          ip: '198.51.100.1\u001b[31mBAD\u001b[0m',
+          route: '/api\nINJECTED_LINE_1',
+          type: 'rate_limit\r\nFAKE',
+          action: 'warned',
+          severity: 'warning'
+        },
+        {
+          ip: '198.51.100.1',
+          route: '/api\r\nINJECTED_LINE_2',
+          type: 'rate_limit',
+          action: 'warned',
+          severity: 'warning'
+        },
+        {
+          ip: '198.51.100.1',
+          route: '/api',
+          type: 'rate_limit',
+          action: 'warn',
+          severity: 'warning'
+        }
+      ];
+      fs.writeFileSync(logFile, events.map((e) => JSON.stringify(e)).join('\n') + '\n', 'utf8');
+
+      const status = calculateStatus(logFile);
+      assert.equal(status.totalEvents, 3);
+      assert.deepEqual(Object.keys(status.typeCounts), ['rate_limit']);
+      assert.equal(status.typeCounts.rate_limit, 3);
+      assert.deepEqual(Object.keys(status.actionCounts), ['warned']);
+      assert.equal(status.actionCounts.warned, 3);
+      assert.deepEqual(status.topIps.map(({ ip }) => ip), ['198.51.100.1']);
+      assert.equal(status.topIps[0].count, 3);
+      assert.deepEqual(status.topRoutes.map(({ route }) => route), ['/api']);
+      assert.equal(status.topRoutes[0].count, 3);
+
+      const logs = [];
+      const output = {
+        log: (message) => logs.push(String(message)),
+        error: () => {}
+      };
+      const code = await runCommand(['status', '--no-color', '--log-dir', tempDir], output);
+      assert.equal(code, 0);
+
+      const rendered = logs.join('\n');
+      assert.doesNotMatch(rendered, /\x1b/);
+      assert.doesNotMatch(rendered, /INJECTED/);
+      const routeLines = rendered.split('\n').filter((l) => l.includes('/api'));
+      assert.equal(routeLines.length, 1);
+      assert.match(routeLines[0], /\/api: 3 events/);
+    });
+
+    test('sanitizeIp extracts valid IP addresses and neutralizes injection payloads', () => {
+      assert.equal(sanitizeIp('127.0.0.1\u001b[31mINJECTED\u001b[0m'), '127.0.0.1');
+      assert.equal(sanitizeIp('\u001b[31m127.0.0.1\u001b[0m'), '127.0.0.1');
+      assert.equal(sanitizeIp('192.168.1.1\r\nINJECTED'), '192.168.1.1');
+      assert.equal(sanitizeIp('::1'), '127.0.0.1');
+      assert.equal(sanitizeIp('::ffff:192.168.1.1'), '192.168.1.1');
+      assert.equal(sanitizeIp('2001:0db8:85a3:0000:0000:8a2e:0370:7334'), '2001:0db8:85a3:0000:0000:8a2e:0370:7334');
+      assert.equal(sanitizeIp('completely-invalid-ip'), 'unknown');
+      assert.equal(sanitizeIp(''), 'unknown');
+      assert.equal(sanitizeIp(null), 'unknown');
+    });
+
+    test('sanitizeType and sanitizeAction strip terminal control sequences and newlines', () => {
+      assert.equal(sanitizeType('rate_limit\u001b[2J'), 'rate_limit');
+      assert.equal(sanitizeType('rate_limit\r\nINJECTED'), 'rate_limit');
+      assert.equal(sanitizeType(''), 'unknown');
+
+      assert.equal(sanitizeAction('warned\x1b[2JINJECTED'), 'warned');
+      assert.equal(sanitizeAction('BLOCKED\r\nINJECTED'), 'blocked');
+      assert.equal(sanitizeAction(''), 'unknown');
     });
   });
 

@@ -46,11 +46,12 @@ function sanitizeRoute(route, maxLength = 500) {
   if (!route || typeof route !== 'string') {
     return '/';
   }
-  let clean = stripAnsi(route);
+  let clean = route.split(/[\r\n]/)[0];
+  clean = stripAnsi(clean);
   // Strip query parameters and URL fragments to prevent credential leakage (CWE-532)
   clean = clean.split('?')[0].split('#')[0];
   // Remove dangerous control characters and newlines
-  clean = clean.replace(/[\x00-\x1f\x7f]/g, '');
+  clean = clean.replace(/[\x00-\x1f\x7f]/g, '').trim();
   if (!clean.startsWith('/')) {
     clean = '/' + clean;
   }

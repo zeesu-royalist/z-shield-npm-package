@@ -6,8 +6,8 @@ const path = require('node:path');
 const net = require('node:net');
 const readline = require('node:readline');
 
-const { stripAnsi, sanitizeString } = require('./logger');
-const { parseDuration, isValidIp } = require('./block-manager');
+const { stripAnsi, sanitizeString, sanitizeRoute, sanitizeMethod } = require('./logger');
+const { parseDuration, isValidIp, normalizeIp } = require('./block-manager');
 
 /**
  * Parses raw command-line arguments into a structured command object.
@@ -285,6 +285,83 @@ function readLogs(logFilePath, limit = 20) {
 }
 
 /**
+ * Sanitizes untrusted IP address values from logs for safe status aggregation and output.
+ * Strips ANSI escapes, truncates at newlines/control characters, and extracts valid IP addresses.
+ *
+ * @param {*} rawIp
+ * @returns {string} Normalized IP address or 'unknown'
+ */
+function sanitizeIp(rawIp) {
+  if (!rawIp || typeof rawIp !== 'string') return 'unknown';
+  const trimmed = rawIp.trim();
+  if (trimmed.length === 0) return 'unknown';
+
+  if (net.isIP(trimmed) !== 0) {
+    return normalizeIp(trimmed);
+  }
+
+  const stripped = stripAnsi(trimmed);
+  if (net.isIP(stripped) !== 0) {
+    return normalizeIp(stripped);
+  }
+
+  const beforeEscape = trimmed.split(/[\x1b\r\n\x00-\x1f\x7f]/)[0].trim();
+  if (beforeEscape.length > 0 && net.isIP(beforeEscape) !== 0) {
+    return normalizeIp(beforeEscape);
+  }
+
+  const ipv4Match = stripped.match(/(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)/);
+  if (ipv4Match && net.isIP(ipv4Match[0]) === 4) {
+    return normalizeIp(ipv4Match[0]);
+  }
+
+  const ipv6Candidates = stripped.match(/[0-9a-fA-F:]+/g);
+  if (ipv6Candidates) {
+    for (const cand of ipv6Candidates) {
+      if (net.isIP(cand) === 6) {
+        return normalizeIp(cand);
+      }
+    }
+  }
+
+  return 'unknown';
+}
+
+/**
+ * Sanitizes untrusted event type strings from logs.
+ *
+ * @param {*} rawType
+ * @param {number} [maxLength=30]
+ * @returns {string} Clean event type string
+ */
+function sanitizeType(rawType, maxLength = 30) {
+  if (!rawType || typeof rawType !== 'string') return 'unknown';
+  let clean = rawType.split(/[\r\n\x1b]/)[0];
+  clean = stripAnsi(clean);
+  clean = clean.replace(/[\x00-\x1f\x7f]/g, ' ').trim();
+  clean = clean.replace(/\s+/g, ' ');
+  return clean.slice(0, maxLength) || 'unknown';
+}
+
+/**
+ * Sanitizes untrusted action strings from logs.
+ *
+ * @param {*} rawAction
+ * @param {number} [maxLength=20]
+ * @returns {string} Clean action string
+ */
+function sanitizeAction(rawAction, maxLength = 20) {
+  if (!rawAction || typeof rawAction !== 'string') return 'unknown';
+  let clean = rawAction.split(/[\r\n\x1b]/)[0];
+  clean = stripAnsi(clean);
+  clean = clean.replace(/[\x00-\x1f\x7f]/g, '').trim().toLowerCase();
+  if (clean === 'warn') clean = 'warned';
+  else if (clean === 'block') clean = 'blocked';
+  else if (clean === 'allow') clean = 'allowed';
+  return clean.slice(0, maxLength) || 'unknown';
+}
+
+/**
  * Computes security summary statistics from the log file.
  *
  * @param {string} logFilePath
@@ -297,16 +374,16 @@ function calculateStatus(logFilePath) {
 
   const { events: allEvents, malformedCount } = readLogs(logFilePath, 100000);
 
-  const ipCounts = {};
-  const routeCounts = {};
-  const typeCounts = {};
-  const actionCounts = {};
+  const ipCounts = Object.create(null);
+  const routeCounts = Object.create(null);
+  const typeCounts = Object.create(null);
+  const actionCounts = Object.create(null);
 
   for (const event of allEvents) {
-    const ip = event.ip || 'unknown';
-    const route = event.route || '/';
-    const type = event.type || 'unknown';
-    const action = event.action || 'unknown';
+    const ip = sanitizeIp(event.ip);
+    const route = sanitizeRoute(event.route);
+    const type = sanitizeType(event.type);
+    const action = sanitizeAction(event.action);
 
     ipCounts[ip] = (ipCounts[ip] || 0) + 1;
     routeCounts[route] = (routeCounts[route] || 0) + 1;
@@ -372,7 +449,8 @@ async function runCommand(argv = process.argv.slice(2), output = console) {
 
       output.log(`\n${c.bold('Actions Breakdown:')}`);
       for (const [action, count] of Object.entries(status.actionCounts)) {
-        const upper = action.toUpperCase();
+        const cleanAction = sanitizeAction(action);
+        const upper = cleanAction.toUpperCase();
         let styledAction = upper;
         if (upper === 'BLOCKED') styledAction = c.bold(c.red(upper));
         else if (upper === 'WARNED') styledAction = c.bold(c.yellow(upper));
@@ -384,20 +462,23 @@ async function runCommand(argv = process.argv.slice(2), output = console) {
 
       output.log(`\n${c.bold('Event Types:')}`);
       for (const [type, count] of Object.entries(status.typeCounts)) {
-        output.log(`  - ${c.yellow(type)}: ${c.bold(count)}`);
+        const cleanType = sanitizeType(type);
+        output.log(`  - ${c.yellow(cleanType)}: ${c.bold(count)}`);
       }
 
       if (status.topIps.length > 0) {
         output.log(`\n${c.bold('Top Offending IPs:')}`);
         for (const item of status.topIps) {
-          output.log(`  - ${c.cyan(item.ip)}: ${c.bold(item.count)} events`);
+          const cleanIp = sanitizeIp(item.ip);
+          output.log(`  - ${c.cyan(cleanIp)}: ${c.bold(item.count)} events`);
         }
       }
 
       if (status.topRoutes.length > 0) {
         output.log(`\n${c.bold('Top Targeted Routes:')}`);
         for (const item of status.topRoutes) {
-          output.log(`  - ${c.underline(item.route)}: ${c.bold(item.count)} events`);
+          const cleanRoute = sanitizeRoute(item.route);
+          output.log(`  - ${c.underline(cleanRoute)}: ${c.bold(item.count)} events`);
         }
       }
 
@@ -676,5 +757,8 @@ module.exports = {
   readLogs,
   calculateStatus,
   resolveLogPath,
-  runCommand
+  runCommand,
+  sanitizeIp,
+  sanitizeType,
+  sanitizeAction
 };
