@@ -3,8 +3,10 @@
 /**
  * Z-Shield Demo Express Application
  *
- * This runnable example demonstrates how a developer mounts Z-Shield
- * into an existing Express application.
+ * Demonstrates:
+ * 1. Monitor Mode vs Protect Mode (toggle via SHIELD_MODE environment variable)
+ * 2. Rate limit enforcement returning HTTP 429
+ * 3. Retry-After headers
  */
 
 const express = require('express');
@@ -13,20 +15,22 @@ const { createShield } = require('../src/index');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Determine mode: default to 'protect' for Phase 3 testing, or 'monitor' if specified
+const currentMode = process.env.SHIELD_MODE === 'monitor' ? 'monitor' : 'protect';
+
 // 1. Initialize Z-Shield
-// In Phase 2, we use a small maxRequests (5) so you can easily test
-// hitting the threshold in your terminal!
 const shield = createShield({
   appName: 'demo-api',
-  mode: 'monitor',
+  mode: currentMode,
   windowMs: 30 * 1000, // 30 second window
   maxRequests: 5,      // 5 requests per 30 seconds
-  maxTrackedIps: 1000, // Memory cap
-  trustProxy: false,   // Set to true only if behind a reverse proxy like Nginx
+  blockDurationMs: 60 * 1000, // 1 minute block duration
+  maxTrackedIps: 1000,
+  trustProxy: false,
   excludeRoutes: ['/health']
 });
 
-// 2. Register Z-Shield middleware as early as possible in your middleware pipeline
+// 2. Register Z-Shield middleware
 app.use(shield.middleware);
 
 // 3. Define sample application routes
@@ -47,7 +51,7 @@ app.get('/api/users', (req, res) => {
   });
 });
 
-// Excluded health check route
+// Excluded health check route (never blocked)
 app.get('/health', (req, res) => {
   res.json({
     status: 'healthy',
@@ -61,10 +65,13 @@ if (require.main === module) {
     console.log(`====================================================`);
     console.log(`🛡️  Z-Shield Demo Server running at http://localhost:${PORT}`);
     console.log(`Mode: ${shield.config.mode.toUpperCase()}`);
+    console.log(`Limit: ${shield.config.maxRequests} requests per ${shield.config.windowMs / 1000}s`);
     console.log(`====================================================`);
-    console.log(`Try running these commands in another terminal:`);
-    console.log(`  curl -i http://localhost:${PORT}/`);
-    console.log(`  curl -i http://localhost:${PORT}/health`);
+    console.log(`To test Protect Mode (returns HTTP 429 after 5 requests):`);
+    console.log(`  for i in {1..6}; do curl -i http://localhost:${PORT}/; done`);
+    console.log(`====================================================`);
+    console.log(`To run in Monitor Mode instead:`);
+    console.log(`  SHIELD_MODE=monitor node examples/express-app.js`);
     console.log(`====================================================`);
   });
 }

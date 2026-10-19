@@ -1,6 +1,9 @@
 'use strict';
 
 const { resolveConfig } = require('./config');
+const { RateLimiter } = require('./rate-limiter');
+const { Detector } = require('./detector');
+const { BlockManager } = require('./block-manager');
 
 /**
  * Safely extracts the client's IP address.
@@ -38,9 +41,6 @@ function extractClientIp(req, trustProxy) {
   return ip || 'unknown';
 }
 
-const { RateLimiter } = require('./rate-limiter');
-const { Detector } = require('./detector');
-
 /**
  * Factory function to create the Z-Shield Express middleware.
  *
@@ -48,55 +48,118 @@ const { Detector } = require('./detector');
  * @param {Object} [dependencies={}] - Injected dependencies (useful for testing)
  * @param {RateLimiter} [dependencies.rateLimiter]
  * @param {Detector} [dependencies.detector]
+ * @param {BlockManager} [dependencies.blockManager]
  * @returns {Function} Express middleware function: (req, res, next) => void
  */
 function createMiddleware(options = {}, dependencies = {}) {
   const config = resolveConfig(options);
   const rateLimiter = dependencies.rateLimiter || new RateLimiter(config);
   const detector = dependencies.detector || new Detector({ rateLimiter, config });
+  const blockManager = dependencies.blockManager || new BlockManager(config);
 
   return function zShieldMiddleware(req, res, next) {
     try {
       const clientIp = extractClientIp(req, config.trustProxy);
       const requestPath = req.path || req.url || '/';
+      const now = Date.now();
 
       // Check if this route is in the exclusion list (e.g. /health check)
       const isExcluded = config.excludeRoutes.some(prefix => requestPath.startsWith(prefix));
 
-      // In Phase 2: Detect abuse if route is not excluded
-      let detection = null;
-      if (!isExcluded) {
-        detection = detector.check(clientIp, req);
+      if (isExcluded) {
+        req.zShield = {
+          ip: clientIp,
+          mode: config.mode,
+          appName: config.appName,
+          isExcluded: true,
+          startTime: now,
+          detection: null,
+          blocked: false
+        };
+        res.setHeader('X-Z-Shield-Protected', '1');
+        res.setHeader('X-Z-Shield-Mode', config.mode);
+        return next();
       }
 
-      // Attach Z-Shield metadata to the request for logging or downstream route handlers
+      // Step 1: Check active temporary blocks
+      const isIpBlocked = blockManager.isBlocked(clientIp, now);
+
+      if (isIpBlocked) {
+        const blockInfo = blockManager.getBlockInfo(clientIp, now);
+        const retryAfterSeconds = Math.max(1, Math.ceil(blockInfo.remainingMs / 1000));
+
+        req.zShield = {
+          ip: clientIp,
+          mode: config.mode,
+          appName: config.appName,
+          isExcluded: false,
+          startTime: now,
+          detection: null,
+          blocked: true,
+          blockReason: blockInfo.reason
+        };
+
+        res.setHeader('X-Z-Shield-Protected', '1');
+        res.setHeader('X-Z-Shield-Mode', config.mode);
+        res.setHeader('X-Z-Shield-Blocked', '1');
+        res.setHeader('X-Z-Shield-Reason', blockInfo.reason);
+        res.setHeader('Retry-After', String(retryAfterSeconds));
+
+        if (config.mode === 'protect') {
+          return res.status(429).json({
+            error: 'Too Many Requests',
+            message: 'Your IP address has been temporarily blocked due to suspicious activity.',
+            retryAfter: retryAfterSeconds
+          });
+        }
+
+        // Monitor mode: mark warning header, but allow request through
+        res.setHeader('X-Z-Shield-Suspicious', '1');
+        return next();
+      }
+
+      // Step 2: Rate limit tracking and abuse detection
+      const detection = detector.check(clientIp, req, now);
+
       req.zShield = {
         ip: clientIp,
         mode: config.mode,
         appName: config.appName,
-        isExcluded,
-        startTime: Date.now(),
-        detection
+        isExcluded: false,
+        startTime: now,
+        detection,
+        blocked: false
       };
 
-      // Set standard informative headers so client and developers know Z-Shield is active
+      // Set informative headers
       res.setHeader('X-Z-Shield-Protected', '1');
       res.setHeader('X-Z-Shield-Mode', config.mode);
+      res.setHeader('X-RateLimit-Limit', String(config.maxRequests));
+      res.setHeader('X-RateLimit-Remaining', String(detection.remaining));
+      res.setHeader('X-RateLimit-Reset', String(Math.ceil(detection.resetTime / 1000)));
 
-      // Expose standard rate limit headers when tracking is active
-      if (detection) {
-        res.setHeader('X-RateLimit-Limit', String(config.maxRequests));
-        res.setHeader('X-RateLimit-Remaining', String(detection.remaining));
-        res.setHeader('X-RateLimit-Reset', String(Math.ceil(detection.resetTime / 1000)));
+      if (detection.isSuspicious) {
+        res.setHeader('X-Z-Shield-Suspicious', '1');
+        res.setHeader('X-Z-Shield-Reason', detection.reason);
 
-        // If suspicious (e.g. threshold exceeded), expose warning headers
-        if (detection.isSuspicious) {
-          res.setHeader('X-Z-Shield-Suspicious', '1');
-          res.setHeader('X-Z-Shield-Reason', detection.reason);
+        if (config.mode === 'protect') {
+          // If autoBlock is enabled, add to block manager
+          if (config.autoBlock) {
+            blockManager.block(clientIp, config.blockDurationMs, detection.reason, now);
+          }
+
+          const retryAfterSeconds = Math.max(1, Math.ceil((detection.resetTime - now) / 1000));
+          res.setHeader('Retry-After', String(retryAfterSeconds));
+
+          return res.status(429).json({
+            error: 'Too Many Requests',
+            message: 'Request threshold exceeded. Please try again later.',
+            retryAfter: retryAfterSeconds
+          });
         }
       }
 
-      // In Phase 2 (monitor mode), requests are allowed to proceed without blocking
+      // In monitor mode or normal traffic in protect mode: allow through
       return next();
     } catch (err) {
       // If an unexpected error occurs in middleware execution, pass it safely to Express

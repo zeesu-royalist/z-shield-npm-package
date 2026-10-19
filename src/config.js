@@ -31,7 +31,16 @@ const DEFAULT_CONFIG = {
 
   // Maximum number of distinct client IPs to track in memory simultaneously
   // Protects against Memory Exhaustion DoS attacks
-  maxTrackedIps: 10000
+  maxTrackedIps: 10000,
+
+  // Duration in milliseconds for temporary IP blocks (default: 15 minutes)
+  blockDurationMs: 15 * 60 * 1000,
+
+  // Maximum number of blocked IPs to keep in memory simultaneously
+  maxBlockedIps: 5000,
+
+  // Whether exceeding rate limit in protect mode automatically triggers a temporary block
+  autoBlock: false
 };
 
 /**
@@ -90,6 +99,21 @@ function resolveConfig(userConfig = {}) {
   // Validate maxTrackedIps
   if (typeof config.maxTrackedIps !== 'number' || !Number.isInteger(config.maxTrackedIps) || config.maxTrackedIps <= 0) {
     throw new TypeError('[Z-Shield] "maxTrackedIps" must be a positive integer.');
+  }
+
+  // Validate blockDurationMs
+  if (typeof config.blockDurationMs !== 'number' || !Number.isFinite(config.blockDurationMs) || config.blockDurationMs <= 0) {
+    throw new TypeError('[Z-Shield] "blockDurationMs" must be a positive number in milliseconds.');
+  }
+
+  // Validate maxBlockedIps
+  if (typeof config.maxBlockedIps !== 'number' || !Number.isInteger(config.maxBlockedIps) || config.maxBlockedIps <= 0) {
+    throw new TypeError('[Z-Shield] "maxBlockedIps" must be a positive integer.');
+  }
+
+  // Validate autoBlock
+  if (typeof config.autoBlock !== 'boolean') {
+    throw new TypeError('[Z-Shield] "autoBlock" must be a boolean (true or false).');
   }
 
   // Freeze the object so application code cannot accidentally mutate it at runtime
