@@ -45,6 +45,8 @@ describe('Z-Shield Phase 4: Persistent Local JSONL Security Event Logging', () =
 
     test('sanitizes routes and methods', () => {
       assert.equal(sanitizeRoute('api/users\n\r'), '/api/users');
+      assert.equal(sanitizeRoute('/auth/reset-password?token=secret123&email=user@test.com#fragment'), '/auth/reset-password');
+      assert.equal(sanitizeRoute('/api/v1/users?apiKey=xyz987'), '/api/v1/users');
       assert.equal(sanitizeMethod('post123'), 'POST');
       assert.equal(sanitizeMethod(''), 'GET');
     });
@@ -223,6 +225,19 @@ describe('Z-Shield Phase 4: Persistent Local JSONL Security Event Logging', () =
         assert.ok(obj.ip.startsWith('192.168.0.'));
       });
     });
+
+    test('flush() waits deterministically for in-flight log operations to complete', async () => {
+      const logger = new Logger({ logDir: tempDir });
+
+      logger.log({ ip: '10.0.0.1', reason: 'Flush test 1' });
+      logger.log({ ip: '10.0.0.2', reason: 'Flush test 2' });
+
+      await logger.flush();
+
+      const logFile = path.join(tempDir, 'events.jsonl');
+      const lines = fs.readFileSync(logFile, 'utf8').trim().split('\n');
+      assert.equal(lines.length, 2);
+    });
   });
 
   describe('Express Middleware Logging Integration', () => {
@@ -252,8 +267,8 @@ describe('Z-Shield Phase 4: Persistent Local JSONL Security Event Logging', () =
         const res3 = await fetch(`http://127.0.0.1:${port}/api/protected`);
         assert.equal(res3.status, 429);
 
-        // Allow queue microtask to flush
-        await new Promise(r => setTimeout(r, 50));
+        // Deterministically wait for async logger queue to finish writing
+        await shield.flush();
 
         const logFile = path.join(tempDir, 'events.jsonl');
         assert.equal(fs.existsSync(logFile), true);
@@ -292,7 +307,7 @@ describe('Z-Shield Phase 4: Persistent Local JSONL Security Event Logging', () =
         const res2 = await fetch(`http://127.0.0.1:${port}/api/monitor`);
         assert.equal(res2.status, 200); // Not blocked in monitor mode!
 
-        await new Promise(r => setTimeout(r, 50));
+        await shield.flush();
 
         const logFile = path.join(tempDir, 'events.jsonl');
         assert.equal(fs.existsSync(logFile), true);
@@ -313,7 +328,7 @@ describe('Z-Shield Phase 4: Persistent Local JSONL Security Event Logging', () =
       shield.block('198.51.100.5', '10m', 'Manual administrative block');
       shield.unblock('198.51.100.5');
 
-      await new Promise(r => setTimeout(r, 50));
+      await shield.flush();
 
       const logFile = path.join(tempDir, 'events.jsonl');
       assert.equal(fs.existsSync(logFile), true);
@@ -331,5 +346,113 @@ describe('Z-Shield Phase 4: Persistent Local JSONL Security Event Logging', () =
       assert.equal(unblockEvent.action, 'unblocked');
       assert.equal(unblockEvent.ip, '198.51.100.5');
     });
+
+    test('never records sensitive query parameters (reset tokens, API keys, emails) in JSONL logs', async () => {
+      const app = express();
+      const shield = createShield({
+        logDir: tempDir,
+        mode: 'protect',
+        maxRequests: 1,
+        windowMs: 60000
+      });
+
+      app.use((req, res, next) => {
+        // Simulate environments where req.path is undefined, falling back to req.url
+        Object.defineProperty(req, 'path', { value: undefined, configurable: true });
+        next();
+      });
+
+      app.use(shield.middleware);
+      app.get('/reset-password', (req, res) => res.send('OK'));
+
+      const server = http.createServer(app);
+      await new Promise(resolve => server.listen(0, resolve));
+      const port = server.address().port;
+
+      try {
+        // Request 1: allowed
+        await fetch(`http://127.0.0.1:${port}/reset-password?token=secret_token_12345&apiKey=super_secret_api_key&email=victim%40example.com#header`);
+
+        // Request 2: rate limit exceeded -> logged as security event
+        const res2 = await fetch(`http://127.0.0.1:${port}/reset-password?token=secret_token_12345&apiKey=super_secret_api_key&email=victim%40example.com#header`);
+        assert.equal(res2.status, 429);
+
+        await shield.flush();
+
+        const logFile = path.join(tempDir, 'events.jsonl');
+        assert.equal(fs.existsSync(logFile), true);
+
+        const logContent = fs.readFileSync(logFile, 'utf8');
+        // Assert sensitive query tokens are never logged
+        assert.ok(!logContent.includes('secret_token_12345'), 'Log must not contain password reset token');
+        assert.ok(!logContent.includes('super_secret_api_key'), 'Log must not contain API key');
+        assert.ok(!logContent.includes('victim@example.com'), 'Log must not contain email address');
+        assert.ok(!logContent.includes('token='), 'Log must not contain query parameter names');
+
+        const lines = logContent.trim().split('\n');
+        const event = JSON.parse(lines[0]);
+        assert.equal(event.route, '/reset-password', 'Logged route must preserve path without query string');
+      } finally {
+        await new Promise(resolve => server.close(resolve));
+      }
+    });
+  });
+
+  describe('Absolute Log Directory Resolution (P4 Regression)', () => {
+    test('resolves relative logDir to absolute path and prevents writes redirecting on chdir', async () => {
+      const originalCwd = process.cwd();
+      const tempRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'zshield-logdir-test-')));
+      const appDir = path.join(tempRoot, 'app');
+      const otherDir = path.join(tempRoot, 'other');
+      fs.mkdirSync(appDir);
+      fs.mkdirSync(otherDir);
+
+      try {
+        process.chdir(appDir);
+
+        // 1. Config resolution with relative logDir
+        const resolvedConfig = resolveConfig({ logDir: './relative-logs' });
+        assert.equal(resolvedConfig.logDir, path.join(appDir, 'relative-logs'));
+        assert.ok(path.isAbsolute(resolvedConfig.logDir));
+
+        // 2. Direct Logger instantiation with relative logDir
+        const directLogger = new Logger({ logDir: './direct-relative-logs' });
+        assert.equal(directLogger.logDir, path.join(appDir, 'direct-relative-logs'));
+        assert.ok(path.isAbsolute(directLogger.filePath));
+
+        // 3. createShield with relative logDir
+        const shield = createShield({ logDir: './shield-logs' });
+        assert.equal(shield.config.logDir, path.join(appDir, 'shield-logs'));
+        assert.ok(path.isAbsolute(shield.logger.filePath));
+
+        // 4. Change current working directory unexpectedly at runtime
+        process.chdir(otherDir);
+
+        // 5. Log event through shield.logger
+        await shield.logger.log({
+          appName: 'test-app',
+          type: 'runtime_test',
+          severity: 'info',
+          ip: '198.51.100.42',
+          action: 'allowed'
+        });
+        await shield.flush();
+
+        // 6. Assert log was written to appDir/shield-logs/events.jsonl, NOT otherDir
+        const expectedLogFile = path.join(appDir, 'shield-logs', 'events.jsonl');
+        assert.ok(fs.existsSync(expectedLogFile), 'Log file must be written to configured absolute path');
+        assert.ok(!fs.existsSync(path.join(otherDir, 'shield-logs')), 'No logs should be written in new working directory');
+        assert.ok(!fs.existsSync(path.join(otherDir, 'events.jsonl')), 'No events.jsonl should appear in new working directory');
+
+        const content = fs.readFileSync(expectedLogFile, 'utf8');
+        assert.ok(content.includes('runtime_test'));
+      } finally {
+        process.chdir(originalCwd);
+        if (fs.existsSync(tempRoot)) {
+          fs.rmSync(tempRoot, { recursive: true, force: true });
+        }
+      }
+    });
   });
 });
+

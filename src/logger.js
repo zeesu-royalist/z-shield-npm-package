@@ -47,6 +47,8 @@ function sanitizeRoute(route, maxLength = 500) {
     return '/';
   }
   let clean = stripAnsi(route);
+  // Strip query parameters and URL fragments to prevent credential leakage (CWE-532)
+  clean = clean.split('?')[0].split('#')[0];
   // Remove dangerous control characters and newlines
   clean = clean.replace(/[\x00-\x1f\x7f]/g, '');
   if (!clean.startsWith('/')) {
@@ -91,7 +93,7 @@ class Logger {
    */
   constructor(config = {}) {
     this.appName = config.appName || 'default-app';
-    this.logDir = config.logDir || path.join(process.cwd(), '.z-shield-logs');
+    this.logDir = path.resolve(config.logDir || path.join(process.cwd(), '.z-shield-logs'));
     this.logFilename = config.logFilename || 'events.jsonl';
     this.filePath = path.join(this.logDir, this.logFilename);
     this.maxLogSizeBytes = config.maxLogSizeBytes || 5 * 1024 * 1024; // 5MB
@@ -149,6 +151,16 @@ class Logger {
           resolve(false);
         });
     });
+  }
+
+  /**
+   * Waits for all currently queued asynchronous log writes to complete.
+   * Useful for deterministic testing, graceful shutdowns, and process exit handlers.
+   *
+   * @returns {Promise<void>}
+   */
+  async flush() {
+    await this._writeQueue;
   }
 
   /**

@@ -3,11 +3,11 @@
 const { resolveConfig } = require('./config');
 const { RateLimiter } = require('./rate-limiter');
 const { Detector } = require('./detector');
-const { BlockManager } = require('./block-manager');
+const { BlockManager, isValidIp, normalizeIp } = require('./block-manager');
 const { Logger } = require('./logger');
 
 /**
- * Safely extracts the client's IP address.
+ * Safely extracts the client's IP address and normalizes IPv4 and IPv6 representations.
  *
  * Security Note:
  * An attacker can easily send spoofed headers like `X-Forwarded-For: 1.2.3.4`.
@@ -29,17 +29,76 @@ function extractClientIp(req, trustProxy) {
     ip = req.connection.remoteAddress;
   }
 
-  // Normalize IPv6-mapped IPv4 addresses (e.g., '::ffff:127.0.0.1' -> '127.0.0.1')
-  if (ip.startsWith('::ffff:')) {
-    ip = ip.substring(7);
+  return normalizeIp(ip);
+}
+
+/**
+ * Determines whether a given request path matches any of the excluded route patterns.
+ * Respects path-segment boundaries so that excluding '/health' matches '/health' or '/health/live'
+ * but does NOT match '/health-admin' or '/healthcare'.
+ * Also normalizes trailing slashes and ignores query strings and fragments.
+ *
+ * @param {string} requestPath - The incoming request path (or raw url)
+ * @param {string[]} excludeRoutes - Configured excluded route prefixes
+ * @returns {boolean}
+ */
+function isRouteExcluded(requestPath, excludeRoutes) {
+  if (!Array.isArray(excludeRoutes) || excludeRoutes.length === 0) {
+    return false;
   }
 
-  // Normalize IPv6 localhost loopback ('::1' -> '127.0.0.1' for cleaner developer output)
-  if (ip === '::1') {
-    ip = '127.0.0.1';
-  }
+  // Strip query string and fragment if present (e.g. from req.url)
+  const cleanPath = (requestPath || '/').split('?')[0].split('#')[0];
 
-  return ip || 'unknown';
+  return excludeRoutes.some((route) => {
+    if (typeof route !== 'string' || route.length === 0) {
+      return false;
+    }
+
+    if (route === '/') {
+      return cleanPath === '/';
+    }
+
+    // Strip trailing slash from route prefix for normalized segment comparison
+    const normalizedPrefix = route.endsWith('/') ? route.slice(0, -1) : route;
+
+    // Exact match (e.g. '/health' === '/health' or '/status' === '/status')
+    if (cleanPath === normalizedPrefix) {
+      return true;
+    }
+
+    // Sub-path segment match (e.g. '/health/check'.startsWith('/health/'))
+    if (cleanPath.startsWith(normalizedPrefix + '/')) {
+      return true;
+    }
+
+    return false;
+  });
+}
+
+/**
+ * Sets a response header only if headers have not already been sent to the client.
+ *
+ * @param {import('express').Response} res
+ * @param {string} name
+ * @param {string} value
+ */
+function safeSetHeader(res, name, value) {
+  if (res && !res.headersSent && typeof res.setHeader === 'function') {
+    res.setHeader(name, value);
+  }
+}
+
+/**
+ * Safely terminates an open HTTP response without calling next() or setting headers.
+ * Used when a blocked request in protect mode already had its headers committed upstream.
+ *
+ * @param {import('express').Response} res
+ */
+function safelyEndResponse(res) {
+  if (res && !res.writableEnded && typeof res.end === 'function') {
+    res.end();
+  }
 }
 
 /**
@@ -63,12 +122,15 @@ function createMiddleware(options = {}, dependencies = {}) {
   return function zShieldMiddleware(req, res, next) {
     try {
       const clientIp = extractClientIp(req, config.trustProxy);
-      const requestPath = req.path || req.url || '/';
+      const rawPath = (typeof req.path === 'string' && req.path.length > 0)
+        ? req.path
+        : (req.url || '/');
+      const requestPath = rawPath.split('?')[0].split('#')[0] || '/';
       const requestMethod = req.method || 'GET';
       const now = Date.now();
 
-      // Check if this route is in the exclusion list (e.g. /health check)
-      const isExcluded = config.excludeRoutes.some(prefix => requestPath.startsWith(prefix));
+      // Check if this route is in the exclusion list (respecting segment boundaries)
+      const isExcluded = isRouteExcluded(requestPath, config.excludeRoutes);
 
       if (isExcluded) {
         req.zShield = {
@@ -80,8 +142,8 @@ function createMiddleware(options = {}, dependencies = {}) {
           detection: null,
           blocked: false
         };
-        res.setHeader('X-Z-Shield-Protected', '1');
-        res.setHeader('X-Z-Shield-Mode', config.mode);
+        safeSetHeader(res, 'X-Z-Shield-Protected', '1');
+        safeSetHeader(res, 'X-Z-Shield-Mode', config.mode);
         return next();
       }
 
@@ -117,22 +179,28 @@ function createMiddleware(options = {}, dependencies = {}) {
           logPromise
         };
 
-        res.setHeader('X-Z-Shield-Protected', '1');
-        res.setHeader('X-Z-Shield-Mode', config.mode);
-        res.setHeader('X-Z-Shield-Blocked', '1');
-        res.setHeader('X-Z-Shield-Reason', blockInfo.reason);
-        res.setHeader('Retry-After', String(retryAfterSeconds));
+        safeSetHeader(res, 'X-Z-Shield-Protected', '1');
+        safeSetHeader(res, 'X-Z-Shield-Mode', config.mode);
+        safeSetHeader(res, 'X-Z-Shield-Blocked', '1');
+        safeSetHeader(res, 'X-Z-Shield-Reason', blockInfo.reason);
+        safeSetHeader(res, 'Retry-After', String(retryAfterSeconds));
 
         if (config.mode === 'protect') {
-          return res.status(429).json({
-            error: 'Too Many Requests',
-            message: 'Your IP address has been temporarily blocked due to suspicious activity.',
-            retryAfter: retryAfterSeconds
-          });
+          if (!res.headersSent) {
+            return res.status(429).json({
+              error: 'Too Many Requests',
+              message: 'Your IP address has been temporarily blocked due to suspicious activity.',
+              retryAfter: retryAfterSeconds
+            });
+          }
+          // If headers were already committed upstream, we cannot send 429.
+          // Safely terminate the open response without calling next().
+          safelyEndResponse(res);
+          return;
         }
 
         // Monitor mode: mark warning header, but allow request through
-        res.setHeader('X-Z-Shield-Suspicious', '1');
+        safeSetHeader(res, 'X-Z-Shield-Suspicious', '1');
         return next();
       }
 
@@ -166,30 +234,38 @@ function createMiddleware(options = {}, dependencies = {}) {
       };
 
       // Set informative headers
-      res.setHeader('X-Z-Shield-Protected', '1');
-      res.setHeader('X-Z-Shield-Mode', config.mode);
-      res.setHeader('X-RateLimit-Limit', String(config.maxRequests));
-      res.setHeader('X-RateLimit-Remaining', String(detection.remaining));
-      res.setHeader('X-RateLimit-Reset', String(Math.ceil(detection.resetTime / 1000)));
+      safeSetHeader(res, 'X-Z-Shield-Protected', '1');
+      safeSetHeader(res, 'X-Z-Shield-Mode', config.mode);
+      safeSetHeader(res, 'X-RateLimit-Limit', String(config.maxRequests));
+      safeSetHeader(res, 'X-RateLimit-Remaining', String(detection.remaining));
+      safeSetHeader(res, 'X-RateLimit-Reset', String(Math.ceil(detection.resetTime / 1000)));
 
       if (detection.isSuspicious) {
-        res.setHeader('X-Z-Shield-Suspicious', '1');
-        res.setHeader('X-Z-Shield-Reason', detection.reason);
+        safeSetHeader(res, 'X-Z-Shield-Suspicious', '1');
+        safeSetHeader(res, 'X-Z-Shield-Reason', detection.reason);
 
         if (config.mode === 'protect') {
-          // If autoBlock is enabled, add to block manager
-          if (config.autoBlock) {
+          // If autoBlock is enabled and IP is valid, add to block manager.
+          // Unknown or invalid IPs must not be passed to blockManager.block()
+          // as that would throw a TypeError and cause an unexpected HTTP 500.
+          if (config.autoBlock && isValidIp(clientIp)) {
             blockManager.block(clientIp, config.blockDurationMs, detection.reason, now);
           }
 
           const retryAfterSeconds = Math.max(1, Math.ceil((detection.resetTime - now) / 1000));
-          res.setHeader('Retry-After', String(retryAfterSeconds));
+          safeSetHeader(res, 'Retry-After', String(retryAfterSeconds));
 
-          return res.status(429).json({
-            error: 'Too Many Requests',
-            message: 'Request threshold exceeded. Please try again later.',
-            retryAfter: retryAfterSeconds
-          });
+          if (!res.headersSent) {
+            return res.status(429).json({
+              error: 'Too Many Requests',
+              message: 'Request threshold exceeded. Please try again later.',
+              retryAfter: retryAfterSeconds
+            });
+          }
+          // If headers were already committed upstream, we cannot send 429.
+          // Safely terminate the open response without calling next().
+          safelyEndResponse(res);
+          return;
         }
       }
 
@@ -205,5 +281,8 @@ function createMiddleware(options = {}, dependencies = {}) {
 
 module.exports = {
   createMiddleware,
-  extractClientIp
+  extractClientIp,
+  isRouteExcluded,
+  normalizeIp,
+  safelyEndResponse
 };

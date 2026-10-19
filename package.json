@@ -1,7 +1,7 @@
 {
   "name": "z-shield",
   "version": "0.1.0",
-  "description": "Production-quality API abuse detection and protection middleware for Node.js & Express",
+  "description": "API abuse detection, rate limiting, and temporary IP blocking middleware for Node.js and Express",
   "main": "src/index.js",
   "bin": {
     "z-shield": "src/cli.js"
@@ -10,6 +10,14 @@
     "test": "node --test test/*.test.js",
     "start": "node examples/express-app.js"
   },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/zeesu-royalist/z-shield-npm-package.git"
+  },
+  "bugs": {
+    "url": "https://github.com/zeesu-royalist/z-shield-npm-package/issues"
+  },
+  "homepage": "https://github.com/zeesu-royalist/z-shield-npm-package#readme",
   "keywords": [
     "security",
     "rate-limit",
@@ -18,7 +26,7 @@
     "middleware",
     "api-protection"
   ],
-  "author": "zeesu-royalist",
+  "author": "zeesu-royalist (https://zeesu-royalist.vercel.app)",
   "license": "MIT",
   "files": [
     "src",

@@ -58,9 +58,9 @@ function parseCliArgs(argv = []) {
  * @returns {string} Absolute path to events.jsonl
  */
 function resolveLogPath(options = {}) {
-  const logDir = options['log-dir'] || options.logDir || path.join(process.cwd(), '.z-shield-logs');
+  const logDir = path.resolve(options['log-dir'] || options.logDir || path.join(process.cwd(), '.z-shield-logs'));
   const filename = options['log-file'] || options.logFile || 'events.jsonl';
-  return path.join(path.resolve(logDir), filename);
+  return path.join(logDir, filename);
 }
 
 /**

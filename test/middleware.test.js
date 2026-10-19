@@ -3,6 +3,7 @@
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 const http = require('node:http');
+const path = require('node:path');
 const express = require('express');
 
 const { createShield, createMiddleware, resolveConfig, DEFAULT_CONFIG } = require('../src/index');
@@ -69,6 +70,19 @@ describe('Z-Shield Phase 1: Configuration & Middleware Foundation', () => {
       assert.throws(() => resolveConfig({ trustProxy: 'yes' }), /"trustProxy" must be a boolean/);
     });
 
+    test('resolves logDir to an absolute path for default and relative paths (P4 regression)', () => {
+      const defaultConfig = resolveConfig();
+      assert.equal(defaultConfig.logDir, path.resolve(process.cwd(), '.z-shield-logs'));
+      assert.ok(path.isAbsolute(defaultConfig.logDir));
+
+      const relativeConfig = resolveConfig({ logDir: './custom-logs' });
+      assert.equal(relativeConfig.logDir, path.resolve('./custom-logs'));
+      assert.ok(path.isAbsolute(relativeConfig.logDir));
+
+      assert.throws(() => resolveConfig({ logDir: '' }), /"logDir" must be a non-empty string path/);
+      assert.throws(() => resolveConfig({ logDir: 123 }), /"logDir" must be a non-empty string path/);
+    });
+
     test('ensures two instances do not share or mutate configuration state', () => {
       const shield1 = createShield({ appName: 'app-one', mode: 'monitor' });
       const shield2 = createShield({ appName: 'app-two', mode: 'protect' });
@@ -124,6 +138,14 @@ describe('Z-Shield Phase 1: Configuration & Middleware Foundation', () => {
 
       const ip = extractClientIp(fakeReq, false);
       assert.equal(ip, '127.0.0.1');
+    });
+
+    test('normalizes uppercase IPv6 and uppercase IPv4-mapped IPv6 addresses', () => {
+      const fakeMapped = { socket: { remoteAddress: '::FFFF:192.168.1.50' } };
+      assert.equal(extractClientIp(fakeMapped, false), '192.168.1.50');
+
+      const fakeIpv6 = { socket: { remoteAddress: '2001:0DB8:85A3:0000:0000:8A2E:0370:7334' } };
+      assert.equal(extractClientIp(fakeIpv6, false), '2001:0db8:85a3:0000:0000:8a2e:0370:7334');
     });
   });
 
@@ -190,6 +212,177 @@ describe('Z-Shield Phase 1: Configuration & Middleware Foundation', () => {
         const body = await response.json();
         assert.equal(body.status, 'healthy');
         assert.equal(body.isExcluded, true);
+      } finally {
+        await new Promise(resolve => server.close(resolve));
+      }
+    });
+
+    test('route exclusion matching respects path-segment boundaries and query strings', async () => {
+      const app = express();
+      const shield = createShield({
+        mode: 'protect',
+        excludeRoutes: ['/health', '/status/']
+      });
+
+      app.use(shield.middleware);
+
+      app.get('/health', (req, res) => res.json({ route: '/health', isExcluded: req.zShield.isExcluded }));
+      app.get('/health/live', (req, res) => res.json({ route: '/health/live', isExcluded: req.zShield.isExcluded }));
+      app.get('/health-check', (req, res) => res.json({ route: '/health-check', isExcluded: req.zShield.isExcluded }));
+      app.get('/healthcare', (req, res) => res.json({ route: '/healthcare', isExcluded: req.zShield.isExcluded }));
+      app.get('/status', (req, res) => res.json({ route: '/status', isExcluded: req.zShield.isExcluded }));
+      app.get('/status/ready', (req, res) => res.json({ route: '/status/ready', isExcluded: req.zShield.isExcluded }));
+      app.get('/status-page', (req, res) => res.json({ route: '/status-page', isExcluded: req.zShield.isExcluded }));
+
+      const server = http.createServer(app);
+      await new Promise(resolve => server.listen(0, resolve));
+      const port = server.address().port;
+
+      try {
+        // Excluded: exact match
+        const resHealth = await fetch(`http://127.0.0.1:${port}/health?query=1`);
+        const bodyHealth = await resHealth.json();
+        assert.equal(bodyHealth.isExcluded, true, '/health should be excluded');
+
+        // Excluded: sub-segment match
+        const resHealthLive = await fetch(`http://127.0.0.1:${port}/health/live`);
+        const bodyHealthLive = await resHealthLive.json();
+        assert.equal(bodyHealthLive.isExcluded, true, '/health/live should be excluded');
+
+        // Excluded: prefix defined with trailing slash
+        const resStatus = await fetch(`http://127.0.0.1:${port}/status`);
+        const bodyStatus = await resStatus.json();
+        assert.equal(bodyStatus.isExcluded, true, '/status should be excluded');
+
+        const resStatusReady = await fetch(`http://127.0.0.1:${port}/status/ready`);
+        const bodyStatusReady = await resStatusReady.json();
+        assert.equal(bodyStatusReady.isExcluded, true, '/status/ready should be excluded');
+
+        // NOT excluded: boundary breach (must NOT match prefix that is not a boundary)
+        const resHealthCheck = await fetch(`http://127.0.0.1:${port}/health-check`);
+        const bodyHealthCheck = await resHealthCheck.json();
+        assert.equal(bodyHealthCheck.isExcluded, false, '/health-check must NOT be excluded');
+
+        const resHealthCare = await fetch(`http://127.0.0.1:${port}/healthcare`);
+        const bodyHealthCare = await resHealthCare.json();
+        assert.equal(bodyHealthCare.isExcluded, false, '/healthcare must NOT be excluded');
+
+        const resStatusPage = await fetch(`http://127.0.0.1:${port}/status-page`);
+        const bodyStatusPage = await resStatusPage.json();
+        assert.equal(bodyStatusPage.isExcluded, false, '/status-page must NOT be excluded');
+      } finally {
+        await new Promise(resolve => server.close(resolve));
+      }
+    });
+
+    test('handles request safely when headers have already been sent by upstream middleware', async () => {
+      const app = express();
+      const shield = createShield({ mode: 'protect', maxRequests: 5 });
+
+      // Upstream middleware commits headers early (e.g. streaming response)
+      app.use((req, res, next) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        next();
+      });
+
+      app.use(shield.middleware);
+
+      app.get('/api/stream', (req, res) => {
+        res.end(JSON.stringify({ status: 'ok', protected: req.zShield ? true : false }));
+      });
+
+      const server = http.createServer(app);
+      await new Promise(resolve => server.listen(0, resolve));
+      const port = server.address().port;
+
+      try {
+        const response = await fetch(`http://127.0.0.1:${port}/api/stream`);
+        assert.equal(response.status, 200);
+        const data = await response.json();
+        assert.equal(data.protected, true);
+      } finally {
+        await new Promise(resolve => server.close(resolve));
+      }
+    });
+
+    test('safely terminates open response without hanging when rate limit is exceeded and headers were flushed upstream', async () => {
+      const app = express();
+      const shield = createShield({ mode: 'protect', maxRequests: 1 });
+
+      let downstreamCallCount = 0;
+
+      // Upstream middleware commits headers early (e.g. streaming or chunked pipeline)
+      app.use((req, res, next) => {
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        next();
+      });
+
+      app.use(shield.middleware);
+
+      app.get('/api/stream-rate-limited', (req, res) => {
+        downstreamCallCount++;
+        res.end('payload');
+      });
+
+      const server = http.createServer(app);
+      await new Promise(resolve => server.listen(0, resolve));
+      const port = server.address().port;
+
+      try {
+        // Request 1: allowed, downstream handler runs
+        const res1 = await fetch(`http://127.0.0.1:${port}/api/stream-rate-limited`, {
+          signal: AbortSignal.timeout(2000)
+        });
+        assert.equal(res1.status, 200);
+        assert.equal(downstreamCallCount, 1);
+
+        // Request 2: rate limit exceeded in protect mode!
+        // Headers were committed upstream as 200, so Z-Shield cannot send 429 JSON.
+        // It must safely end the open response stream without hanging, and without calling downstream.
+        const res2 = await fetch(`http://127.0.0.1:${port}/api/stream-rate-limited`, {
+          signal: AbortSignal.timeout(2000)
+        });
+        assert.equal(res2.status, 200);
+        await res2.text(); // Successfully reads EOF without hanging
+        assert.equal(downstreamCallCount, 1, 'Downstream handler should not have been called for rate-limited request');
+      } finally {
+        await new Promise(resolve => server.close(resolve));
+      }
+    });
+
+    test('safely terminates open response without hanging when IP is already blocked and headers were flushed upstream', async () => {
+      const app = express();
+      const shield = createShield({ mode: 'protect' });
+
+      // Block client IP in advance
+      shield.block('127.0.0.1', '10m', 'Pre-blocked test IP');
+
+      let downstreamCalled = false;
+
+      // Upstream middleware commits headers early
+      app.use((req, res, next) => {
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        next();
+      });
+
+      app.use(shield.middleware);
+
+      app.get('/api/stream-already-blocked', (req, res) => {
+        downstreamCalled = true;
+        res.end('payload');
+      });
+
+      const server = http.createServer(app);
+      await new Promise(resolve => server.listen(0, resolve));
+      const port = server.address().port;
+
+      try {
+        const response = await fetch(`http://127.0.0.1:${port}/api/stream-already-blocked`, {
+          signal: AbortSignal.timeout(2000)
+        });
+        assert.equal(response.status, 200);
+        await response.text(); // Reads EOF without hanging
+        assert.equal(downstreamCalled, false, 'Downstream handler should not have been called for blocked IP');
       } finally {
         await new Promise(resolve => server.close(resolve));
       }

@@ -1,5 +1,7 @@
 'use strict';
 
+const { normalizeIp } = require('./block-manager');
+
 /**
  * RateLimiter - Bounded In-Memory Request Counter
  *
@@ -38,11 +40,9 @@ class RateLimiter {
    * @returns {{ count: number, remaining: number, resetTime: number, isExceeded: boolean }}
    */
   record(ip, now = Date.now()) {
-    if (!ip || typeof ip !== 'string') {
-      ip = 'unknown';
-    }
+    const cleanIp = normalizeIp(ip);
 
-    let entry = this.records.get(ip);
+    let entry = this.records.get(cleanIp);
 
     // If an existing entry has expired, treat it as a fresh window
     if (entry && now >= entry.resetTime) {
@@ -54,11 +54,11 @@ class RateLimiter {
       entry.count += 1;
 
       // Refresh LRU order: delete and re-set so this IP is marked as most recently used
-      this.records.delete(ip);
-      this.records.set(ip, entry);
+      this.records.delete(cleanIp);
+      this.records.set(cleanIp, entry);
     } else {
-      // New window or expired window: check capacity before adding new entry
-      if (this.records.size >= this.maxTrackedIps) {
+      // New window or expired window: only evict if adding a NEW IP at capacity
+      if (!this.records.has(cleanIp) && this.records.size >= this.maxTrackedIps) {
         this._evictOldest(now);
       }
 
@@ -67,7 +67,9 @@ class RateLimiter {
         resetTime: now + this.windowMs
       };
 
-      this.records.set(ip, entry);
+      // Delete first to ensure refreshed LRU order in Map
+      this.records.delete(cleanIp);
+      this.records.set(cleanIp, entry);
     }
 
     const remaining = Math.max(0, this.maxRequests - entry.count);
@@ -89,7 +91,8 @@ class RateLimiter {
    * @returns {{ count: number, remaining: number, resetTime: number, isExceeded: boolean }}
    */
   get(ip, now = Date.now()) {
-    const entry = this.records.get(ip);
+    const cleanIp = normalizeIp(ip);
+    const entry = this.records.get(cleanIp);
 
     if (!entry || now >= entry.resetTime) {
       return {
@@ -113,7 +116,8 @@ class RateLimiter {
    * @param {string} ip
    */
   reset(ip) {
-    this.records.delete(ip);
+    const cleanIp = normalizeIp(ip);
+    this.records.delete(cleanIp);
   }
 
   /**

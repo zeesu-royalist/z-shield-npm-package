@@ -32,10 +32,46 @@ describe('Z-Shield Phase 3: Protection Mode & Temporary IP Blocking', () => {
       assert.equal(parseDuration('10m'), 600000);
       assert.equal(parseDuration('1h'), 3600000);
       assert.equal(parseDuration('2d'), 172800000);
+      assert.equal(parseDuration('1.5s'), 1500);
+      assert.equal(parseDuration(' 10m '), 600000);
 
       assert.throws(() => parseDuration(-100), /Block duration must be a positive number/);
+      assert.throws(() => parseDuration(0), /Block duration must be a positive number/);
       assert.throws(() => parseDuration('forever'), /Invalid duration format/);
       assert.throws(() => parseDuration({}), /Block duration must be a number/);
+    });
+
+    test('rejects zero and negative duration inputs consistently (P3 regression)', () => {
+      // String inputs with units
+      assert.throws(() => parseDuration('0s'), /Block duration must be greater than zero/);
+      assert.throws(() => parseDuration('0m'), /Block duration must be greater than zero/);
+      assert.throws(() => parseDuration('0ms'), /Block duration must be greater than zero/);
+      assert.throws(() => parseDuration('0h'), /Block duration must be greater than zero/);
+      assert.throws(() => parseDuration('0d'), /Block duration must be greater than zero/);
+      assert.throws(() => parseDuration('0.0s'), /Block duration must be greater than zero/);
+      assert.throws(() => parseDuration('0'), /Block duration must be greater than zero/);
+
+      // Negative string inputs
+      assert.throws(() => parseDuration('-5s'), /Block duration must be greater than zero/);
+      assert.throws(() => parseDuration('-10m'), /Block duration must be greater than zero/);
+      assert.throws(() => parseDuration('-100'), /Block duration must be greater than zero/);
+
+      // Sub-millisecond rounding down to zero
+      assert.throws(() => parseDuration('0.0001ms'), /Block duration must be greater than zero/);
+
+      // Numeric inputs
+      assert.throws(() => parseDuration(0), /Block duration must be a positive number/);
+      assert.throws(() => parseDuration(-1), /Block duration must be a positive number/);
+      assert.throws(() => parseDuration(-5000), /Block duration must be a positive number/);
+      assert.throws(() => parseDuration(0.4), /Block duration must be a positive number/);
+
+      // Verify BlockManager rejects zero durations
+      const bm = new BlockManager();
+      assert.throws(() => bm.block('198.51.100.1', '0s'), /Block duration must be greater than zero/);
+      assert.throws(() => bm.block('198.51.100.1', '0m'), /Block duration must be greater than zero/);
+      assert.throws(() => bm.block('198.51.100.1', '0ms'), /Block duration must be greater than zero/);
+      assert.throws(() => bm.block('198.51.100.1', 0), /Block duration must be a positive number/);
+      assert.equal(bm.isBlocked('198.51.100.1'), false);
     });
 
     test('blocks and unblocks an IP address', () => {
@@ -59,6 +95,24 @@ describe('Z-Shield Phase 3: Protection Mode & Temporary IP Blocking', () => {
       const unblocked = bm.unblock('198.51.100.1');
       assert.equal(unblocked, true);
       assert.equal(bm.isBlocked('198.51.100.1', now), false);
+    });
+
+    test('normalizes IPv6 casing and mapped IPv4 so block/lookup/unblock match regardless of case', () => {
+      const bm = new BlockManager();
+
+      // Block with uppercase IPv6
+      bm.block('2001:0DB8:85A3:0000:0000:8A2E:0370:7334', '10m', 'Case test');
+      assert.equal(bm.isBlocked('2001:0db8:85a3:0000:0000:8a2e:0370:7334'), true);
+      assert.ok(bm.getBlockInfo('2001:0db8:85a3:0000:0000:8a2e:0370:7334') !== null);
+
+      // Unblock with lowercase
+      assert.equal(bm.unblock('2001:0db8:85a3:0000:0000:8a2e:0370:7334'), true);
+      assert.equal(bm.isBlocked('2001:0DB8:85A3:0000:0000:8A2E:0370:7334'), false);
+
+      // IPv4-mapped IPv6 uppercase
+      bm.block('::FFFF:192.0.2.1', '10m');
+      assert.equal(bm.isBlocked('192.0.2.1'), true);
+      assert.equal(bm.isBlocked('::ffff:192.0.2.1'), true);
     });
 
     test('rejects blocking an invalid IP address', () => {
@@ -292,6 +346,47 @@ describe('Z-Shield Phase 3: Protection Mode & Temporary IP Blocking', () => {
         const res3 = await fetch(`http://127.0.0.1:${port}/api/data`);
         assert.equal(res3.status, 429);
         assert.equal(res3.headers.get('x-z-shield-blocked'), '1');
+      } finally {
+        await new Promise(resolve => server.close(resolve));
+      }
+    });
+
+    test('autoBlock with unknown or invalid IP returns 429 without causing HTTP 500', async () => {
+      const app = express();
+      const shield = createShield({
+        mode: 'protect',
+        maxRequests: 1,
+        autoBlock: true,
+        blockDurationMs: 60000
+      });
+
+      // Upstream middleware simulating an environment where client IP cannot be determined
+      app.use((req, res, next) => {
+        Object.defineProperty(req.socket, 'remoteAddress', { value: undefined, configurable: true });
+        if (req.connection) {
+          Object.defineProperty(req.connection, 'remoteAddress', { value: undefined, configurable: true });
+        }
+        next();
+      });
+
+      app.use(shield.middleware);
+      app.get('/api/test-unknown-ip', (req, res) => res.send('OK'));
+
+      const server = http.createServer(app);
+      await new Promise(resolve => server.listen(0, resolve));
+      const port = server.address().port;
+
+      try {
+        // Request 1: OK
+        const res1 = await fetch(`http://127.0.0.1:${port}/api/test-unknown-ip`);
+        assert.equal(res1.status, 200);
+
+        // Request 2: exceeds limit -> in protect mode with autoBlock: true
+        // Should return 429 Too Many Requests, NOT 500 Internal Server Error
+        const res2 = await fetch(`http://127.0.0.1:${port}/api/test-unknown-ip`);
+        assert.equal(res2.status, 429, 'Should return 429 instead of throwing 500');
+        const body2 = await res2.json();
+        assert.equal(body2.error, 'Too Many Requests');
       } finally {
         await new Promise(resolve => server.close(resolve));
       }

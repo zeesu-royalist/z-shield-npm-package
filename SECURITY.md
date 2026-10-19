@@ -9,7 +9,7 @@ We take the security of **Z-Shield** seriously. If you discover a security vulne
 ### How to Report Privately
 Please submit vulnerability reports privately through one of the following channels:
 1. **GitHub Private Vulnerability Reporting**: Use the "Report a vulnerability" button under the **Security** tab of the Z-Shield repository (recommended).
-2. **Designated Maintainer Contact**: `[Insert Security Contact / r]`
+2. **Designated Maintainer Contact**: `md.jishan.dev@gmail.com`
 
 You will receive an acknowledgment of your report within 48 hours, followed by regular status updates as we evaluate and remediate the issue.
 

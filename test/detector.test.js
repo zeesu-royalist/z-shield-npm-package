@@ -88,6 +88,27 @@ describe('Z-Shield Phase 2: Request Detection & Bounded Counters', () => {
       assert.equal(limiter.get('10.0.0.3', now + 50).count, 1);
     });
 
+    test('refreshing an expired existing IP does not evict an unrelated active IP when at capacity', () => {
+      const limiter = new RateLimiter({ windowMs: 1000, maxRequests: 5, maxTrackedIps: 2 });
+      const t0 = 1000;
+
+      // Track IP A and IP B at capacity (2 IPs)
+      limiter.record('1.1.1.1', t0);      // window expires at 1000 + 1000 = 2000
+      limiter.record('2.2.2.2', t0 + 500); // window expires at 1500 + 1000 = 2500
+
+      // Touch IP A again within its window to make IP B the LRU entry in Map
+      limiter.record('1.1.1.1', t0 + 600); // Map order: ['2.2.2.2', '1.1.1.1']
+
+      // Advance time to 2100: IP A has expired (2100 >= 2000), but IP B is still active (2100 < 2500)
+      // Refreshing IP A must reset IP A's window, but must NOT evict active IP B
+      limiter.record('1.1.1.1', t0 + 1100);
+
+      // Verify active IP B was NOT evicted
+      const bStatus = limiter.get('2.2.2.2', t0 + 1100);
+      assert.equal(bStatus.count, 1, 'Active IP B should not have been evicted');
+      assert.equal(limiter.size, 2, 'Limiter size should remain 2');
+    });
+
     test('pruneExpired removes old counters without affecting active ones', () => {
       const limiter = new RateLimiter({ windowMs: 1000, maxRequests: 5 });
       const now = 10000;
@@ -114,6 +135,19 @@ describe('Z-Shield Phase 2: Request Detection & Bounded Counters', () => {
 
       assert.equal(limiterA.get('1.1.1.1').count, 2);
       assert.equal(limiterB.get('1.1.1.1').count, 0);
+    });
+
+    test('normalizes IPv6 casing so uppercase and lowercase addresses share counters', () => {
+      const limiter = new RateLimiter({ maxRequests: 5 });
+
+      limiter.record('2001:0DB8::1');
+      assert.equal(limiter.get('2001:0db8::1').count, 1);
+
+      limiter.record('2001:0db8::1');
+      assert.equal(limiter.get('2001:0DB8::1').count, 2);
+
+      limiter.reset('2001:0DB8::1');
+      assert.equal(limiter.get('2001:0db8::1').count, 0);
     });
   });
 

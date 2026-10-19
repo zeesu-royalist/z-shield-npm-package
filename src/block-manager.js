@@ -3,6 +3,53 @@
 const net = require('node:net');
 
 /**
+ * Normalizes an IP address for consistent comparison across IPv4 and IPv6.
+ * - Trims whitespace
+ * - Unmaps IPv4-mapped IPv6 addresses (e.g. '::ffff:192.168.1.1' -> '192.168.1.1')
+ * - Normalizes IPv6 loopback ('::1' -> '127.0.0.1')
+ * - Converts IPv6 hex characters to lowercase to prevent case-sensitive map misses
+ * - Preserves invalid strings without converting them into fake valid IPs
+ *
+ * @param {*} ip
+ * @returns {string} Normalized IP or 'unknown'
+ */
+function normalizeIp(ip) {
+  if (typeof ip !== 'string') {
+    return 'unknown';
+  }
+  const trimmed = ip.trim();
+  if (trimmed.length === 0) {
+    return 'unknown';
+  }
+
+  const lower = trimmed.toLowerCase();
+
+  // IPv6-mapped IPv4 addresses (e.g. '::ffff:192.168.1.1' or '::FFFF:192.168.1.1')
+  if (lower.startsWith('::ffff:')) {
+    const candidateIpv4 = trimmed.substring(7);
+    if (net.isIP(candidateIpv4) === 4) {
+      return candidateIpv4;
+    }
+  }
+
+  // IPv6 loopback ('::1')
+  if (lower === '::1') {
+    return '127.0.0.1';
+  }
+
+  // Standard valid IPv4 or IPv6
+  const ipType = net.isIP(trimmed);
+  if (ipType === 6) {
+    return lower;
+  }
+  if (ipType === 4) {
+    return trimmed;
+  }
+
+  return trimmed;
+}
+
+/**
  * Validates whether an IP address is a valid IPv4 or IPv6 string.
  * Uses Node.js built-in net.isIP (returns 4 for IPv4, 6 for IPv6, 0 for invalid).
  *
@@ -13,7 +60,8 @@ function isValidIp(ip) {
   if (typeof ip !== 'string' || ip.trim().length === 0) {
     return false;
   }
-  return net.isIP(ip.trim()) !== 0;
+  const norm = normalizeIp(ip);
+  return net.isIP(norm) !== 0;
 }
 
 /**
@@ -25,27 +73,37 @@ function isValidIp(ip) {
  */
 function parseDuration(duration) {
   if (typeof duration === 'number') {
-    if (!Number.isFinite(duration) || duration <= 0) {
+    const ms = Math.floor(duration);
+    if (!Number.isFinite(duration) || duration <= 0 || ms <= 0) {
       throw new TypeError('[Z-Shield] Block duration must be a positive number in milliseconds.');
     }
-    return Math.floor(duration);
+    return ms;
   }
 
   if (typeof duration === 'string') {
-    const match = duration.trim().match(/^(\d+(?:\.\d+)?)\s*(ms|s|m|h|d)?$/i);
+    const trimmed = duration.trim();
+    const match = trimmed.match(/^(-?\d+(?:\.\d+)?)\s*(ms|s|m|h|d)?$/i);
     if (!match) {
       throw new Error(`[Z-Shield] Invalid duration format: "${duration}". Use format like "10m", "1h", "30s", or milliseconds.`);
     }
     const val = parseFloat(match[1]);
-    const unit = (match[2] || 'ms').toLowerCase();
-    switch (unit) {
-      case 'ms': return Math.floor(val);
-      case 's': return Math.floor(val * 1000);
-      case 'm': return Math.floor(val * 60 * 1000);
-      case 'h': return Math.floor(val * 60 * 60 * 1000);
-      case 'd': return Math.floor(val * 24 * 60 * 60 * 1000);
-      default: return Math.floor(val);
+    if (!Number.isFinite(val) || val <= 0) {
+      throw new Error('[Z-Shield] Block duration must be greater than zero.');
     }
+    const unit = (match[2] || 'ms').toLowerCase();
+    let ms;
+    switch (unit) {
+      case 'ms': ms = Math.floor(val); break;
+      case 's': ms = Math.floor(val * 1000); break;
+      case 'm': ms = Math.floor(val * 60 * 1000); break;
+      case 'h': ms = Math.floor(val * 60 * 60 * 1000); break;
+      case 'd': ms = Math.floor(val * 24 * 60 * 60 * 1000); break;
+      default: ms = Math.floor(val); break;
+    }
+    if (ms <= 0) {
+      throw new Error('[Z-Shield] Block duration must be greater than zero.');
+    }
+    return ms;
   }
 
   throw new TypeError('[Z-Shield] Block duration must be a number (milliseconds) or a duration string like "10m".');
@@ -89,7 +147,7 @@ class BlockManager {
     }
 
     const durationMs = parseDuration(duration);
-    const cleanIp = ip.trim();
+    const cleanIp = normalizeIp(ip);
 
     // Bound memory: if at capacity, evict an old entry before inserting
     if (this.blocks.size >= this.maxBlockedIps && !this.blocks.has(cleanIp)) {
@@ -125,7 +183,7 @@ class BlockManager {
     if (!isValidIp(ip)) {
       throw new TypeError(`[Z-Shield] Cannot unblock invalid IP address: "${ip}".`);
     }
-    return this.blocks.delete(ip.trim());
+    return this.blocks.delete(normalizeIp(ip));
   }
 
   /**
@@ -141,7 +199,7 @@ class BlockManager {
       return false;
     }
 
-    const cleanIp = ip.trim();
+    const cleanIp = normalizeIp(ip);
     const entry = this.blocks.get(cleanIp);
 
     if (!entry) {
@@ -169,7 +227,7 @@ class BlockManager {
       return null;
     }
 
-    const cleanIp = ip.trim();
+    const cleanIp = normalizeIp(ip);
     const entry = this.blocks.get(cleanIp);
 
     return {
@@ -263,5 +321,6 @@ class BlockManager {
 module.exports = {
   BlockManager,
   isValidIp,
+  normalizeIp,
   parseDuration
 };

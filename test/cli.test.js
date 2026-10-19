@@ -85,6 +85,16 @@ describe('Z-Shield Phase 5: CLI Commands & Architecture', () => {
       assert.equal(status.totalEvents, 0);
     });
 
+    test('resolves log file path to an absolute path for default and custom options', () => {
+      const defaultLog = resolveLogPath();
+      assert.equal(defaultLog, path.join(process.cwd(), '.z-shield-logs', 'events.jsonl'));
+      assert.ok(path.isAbsolute(defaultLog));
+
+      const relativeLog = resolveLogPath({ 'log-dir': './custom-logs' });
+      assert.equal(relativeLog, path.join(path.resolve('./custom-logs'), 'events.jsonl'));
+      assert.ok(path.isAbsolute(relativeLog));
+    });
+
     test('skips malformed JSON lines without crashing and reports count', () => {
       const logFile = path.join(tempDir, 'test-events.jsonl');
       const sample = [
@@ -158,6 +168,11 @@ describe('Z-Shield Phase 5: CLI Commands & Architecture', () => {
       const code3 = await runCommand(['block', '198.51.100.1', '--duration', 'bad-duration'], mock3);
       assert.equal(code3, 1);
       assert.ok(mock3.getStderr().includes('Invalid duration format'));
+
+      const mock4 = createMockOutput();
+      const code4 = await runCommand(['block', '198.51.100.1', '--duration', '0s'], mock4);
+      assert.equal(code4, 1);
+      assert.ok(mock4.getStderr().includes('Block duration must be greater than zero'));
     });
 
     test('block command with valid input explains process-local architecture and logs audit record', async () => {

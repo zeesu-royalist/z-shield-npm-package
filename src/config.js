@@ -20,7 +20,7 @@ const DEFAULT_CONFIG = {
   maxRequests: 100,
 
   // Directory where JSONL security event logs will be stored
-  logDir: path.join(process.cwd(), '.z-shield-logs'),
+  logDir: path.resolve(process.cwd(), '.z-shield-logs'),
 
   // Whether to trust reverse-proxy IP headers (e.g., X-Forwarded-For)
   // CRITICAL: Must be false by default to prevent client IP spoofing attacks
@@ -154,6 +154,7 @@ function resolveConfig(userConfig = {}) {
   // Freeze the object so application code cannot accidentally mutate it at runtime
   return Object.freeze({
     ...config,
+    logDir: path.resolve(config.logDir),
     excludeRoutes: Object.freeze([...config.excludeRoutes])
   });
 }

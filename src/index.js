@@ -80,7 +80,8 @@ function createShield(options = {}) {
 
     isBlocked: (ip) => blockManager.isBlocked(ip),
     getBlockInfo: (ip) => blockManager.getBlockInfo(ip),
-    listBlocks: () => blockManager.listBlocks()
+    listBlocks: () => blockManager.listBlocks(),
+    flush: () => logger.flush()
   };
 }
 
