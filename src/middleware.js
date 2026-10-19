@@ -4,6 +4,7 @@ const { resolveConfig } = require('./config');
 const { RateLimiter } = require('./rate-limiter');
 const { Detector } = require('./detector');
 const { BlockManager } = require('./block-manager');
+const { Logger } = require('./logger');
 
 /**
  * Safely extracts the client's IP address.
@@ -49,6 +50,7 @@ function extractClientIp(req, trustProxy) {
  * @param {RateLimiter} [dependencies.rateLimiter]
  * @param {Detector} [dependencies.detector]
  * @param {BlockManager} [dependencies.blockManager]
+ * @param {Logger} [dependencies.logger]
  * @returns {Function} Express middleware function: (req, res, next) => void
  */
 function createMiddleware(options = {}, dependencies = {}) {
@@ -56,11 +58,13 @@ function createMiddleware(options = {}, dependencies = {}) {
   const rateLimiter = dependencies.rateLimiter || new RateLimiter(config);
   const detector = dependencies.detector || new Detector({ rateLimiter, config });
   const blockManager = dependencies.blockManager || new BlockManager(config);
+  const logger = dependencies.logger || new Logger(config);
 
   return function zShieldMiddleware(req, res, next) {
     try {
       const clientIp = extractClientIp(req, config.trustProxy);
       const requestPath = req.path || req.url || '/';
+      const requestMethod = req.method || 'GET';
       const now = Date.now();
 
       // Check if this route is in the exclusion list (e.g. /health check)
@@ -87,6 +91,19 @@ function createMiddleware(options = {}, dependencies = {}) {
       if (isIpBlocked) {
         const blockInfo = blockManager.getBlockInfo(clientIp, now);
         const retryAfterSeconds = Math.max(1, Math.ceil(blockInfo.remainingMs / 1000));
+        const action = config.mode === 'protect' ? 'blocked' : 'warned';
+
+        // Log the security event asynchronously
+        const logPromise = logger.log({
+          appName: config.appName,
+          type: 'blocked_ip',
+          severity: 'warning',
+          ip: clientIp,
+          method: requestMethod,
+          route: requestPath,
+          reason: blockInfo.reason,
+          action
+        });
 
         req.zShield = {
           ip: clientIp,
@@ -96,7 +113,8 @@ function createMiddleware(options = {}, dependencies = {}) {
           startTime: now,
           detection: null,
           blocked: true,
-          blockReason: blockInfo.reason
+          blockReason: blockInfo.reason,
+          logPromise
         };
 
         res.setHeader('X-Z-Shield-Protected', '1');
@@ -121,6 +139,21 @@ function createMiddleware(options = {}, dependencies = {}) {
       // Step 2: Rate limit tracking and abuse detection
       const detection = detector.check(clientIp, req, now);
 
+      let logPromise = null;
+      if (detection.isSuspicious) {
+        const action = config.mode === 'protect' ? 'blocked' : 'warned';
+        logPromise = logger.log({
+          appName: config.appName,
+          type: detection.type || 'rate_limit',
+          severity: detection.severity || 'warning',
+          ip: clientIp,
+          method: requestMethod,
+          route: requestPath,
+          reason: detection.reason,
+          action
+        });
+      }
+
       req.zShield = {
         ip: clientIp,
         mode: config.mode,
@@ -128,7 +161,8 @@ function createMiddleware(options = {}, dependencies = {}) {
         isExcluded: false,
         startTime: now,
         detection,
-        blocked: false
+        blocked: false,
+        logPromise
       };
 
       // Set informative headers

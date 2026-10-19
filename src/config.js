@@ -40,7 +40,19 @@ const DEFAULT_CONFIG = {
   maxBlockedIps: 5000,
 
   // Whether exceeding rate limit in protect mode automatically triggers a temporary block
-  autoBlock: false
+  autoBlock: false,
+
+  // Filename for the active JSON Lines log file
+  logFilename: 'events.jsonl',
+
+  // Maximum size in bytes before rotating the log file (default: 5MB)
+  maxLogSizeBytes: 5 * 1024 * 1024,
+
+  // Maximum number of rotated log files to retain
+  maxLogFiles: 5,
+
+  // Optional custom error callback: (err, event) => void
+  onLogError: null
 };
 
 /**
@@ -114,6 +126,29 @@ function resolveConfig(userConfig = {}) {
   // Validate autoBlock
   if (typeof config.autoBlock !== 'boolean') {
     throw new TypeError('[Z-Shield] "autoBlock" must be a boolean (true or false).');
+  }
+
+  // Validate logFilename
+  if (typeof config.logFilename !== 'string' || config.logFilename.trim().length === 0) {
+    throw new TypeError('[Z-Shield] "logFilename" must be a non-empty string.');
+  }
+  if (!/^[a-zA-Z0-9._-]+$/.test(config.logFilename) || config.logFilename.includes('..')) {
+    throw new Error('[Z-Shield] "logFilename" must be a safe filename without path traversal characters.');
+  }
+
+  // Validate maxLogSizeBytes
+  if (typeof config.maxLogSizeBytes !== 'number' || !Number.isInteger(config.maxLogSizeBytes) || config.maxLogSizeBytes <= 0) {
+    throw new TypeError('[Z-Shield] "maxLogSizeBytes" must be a positive integer.');
+  }
+
+  // Validate maxLogFiles
+  if (typeof config.maxLogFiles !== 'number' || !Number.isInteger(config.maxLogFiles) || config.maxLogFiles < 0) {
+    throw new TypeError('[Z-Shield] "maxLogFiles" must be a non-negative integer.');
+  }
+
+  // Validate onLogError
+  if (config.onLogError !== null && typeof config.onLogError !== 'function') {
+    throw new TypeError('[Z-Shield] "onLogError" must be null or a function.');
   }
 
   // Freeze the object so application code cannot accidentally mutate it at runtime

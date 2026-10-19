@@ -66,12 +66,13 @@ if (require.main === module) {
     console.log(`🛡️  Z-Shield Demo Server running at http://localhost:${PORT}`);
     console.log(`Mode: ${shield.config.mode.toUpperCase()}`);
     console.log(`Limit: ${shield.config.maxRequests} requests per ${shield.config.windowMs / 1000}s`);
+    console.log(`Log File: ${shield.logger.filePath}`);
     console.log(`====================================================`);
     console.log(`To test Protect Mode (returns HTTP 429 after 5 requests):`);
-    console.log(`  for i in {1..6}; do curl -i http://localhost:${PORT}/; done`);
+    console.log(`  for i in {1..6}; do curl -s -i http://localhost:${PORT}/ | head -n 8; echo "---"; done`);
     console.log(`====================================================`);
-    console.log(`To run in Monitor Mode instead:`);
-    console.log(`  SHIELD_MODE=monitor node examples/express-app.js`);
+    console.log(`To view logged security events in your terminal:`);
+    console.log(`  cat .z-shield-logs/events.jsonl`);
     console.log(`====================================================`);
   });
 }
