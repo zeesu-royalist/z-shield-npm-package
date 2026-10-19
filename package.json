@@ -1,6 +1,6 @@
 {
   "name": "z-shield",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "API abuse detection, rate limiting, and temporary IP blocking middleware for Node.js and Express",
   "main": "src/index.js",
   "bin": {
