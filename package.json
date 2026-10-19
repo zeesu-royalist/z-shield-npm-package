@@ -18,8 +18,14 @@
     "middleware",
     "api-protection"
   ],
-  "author": "",
+  "author": "zeesu-royalist",
   "license": "MIT",
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "SECURITY.md"
+  ],
   "devDependencies": {
     "express": "^4.21.2"
   },
