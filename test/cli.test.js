@@ -8,6 +8,8 @@ const os = require('node:os');
 const { execFileSync } = require('node:child_process');
 
 const {
+  createColors,
+  resolveColorSupport,
   parseCliArgs,
   formatLogEvent,
   readLogs,
@@ -15,6 +17,7 @@ const {
   resolveLogPath,
   runCommand
 } = require('../src/cli');
+const { stripAnsi } = require('../src/logger');
 
 describe('Z-Shield Phase 5: CLI Commands & Architecture', () => {
   let tempDir;
@@ -181,9 +184,10 @@ describe('Z-Shield Phase 5: CLI Commands & Architecture', () => {
       assert.equal(code, 0);
 
       const out = mock.getStdout();
-      assert.ok(out.includes('Target IP:  198.51.100.5'));
-      assert.ok(out.includes('Process-Local Architecture Notice'));
-      assert.ok(out.includes('shield.block(\'198.51.100.5\''));
+      const cleanOut = stripAnsi(out);
+      assert.ok(cleanOut.includes('Target IP:  198.51.100.5'));
+      assert.ok(cleanOut.includes('Process-Local Architecture Notice'));
+      assert.ok(cleanOut.includes('shield.block(\'198.51.100.5\''));
 
       // Check audit log was written
       const logFile = path.join(tempDir, 'events.jsonl');
@@ -198,11 +202,243 @@ describe('Z-Shield Phase 5: CLI Commands & Architecture', () => {
       assert.equal(code, 0);
 
       const out = mock.getStdout();
-      assert.ok(out.includes('shield.unblock(\'198.51.100.5\')'));
+      const cleanOut = stripAnsi(out);
+      assert.ok(cleanOut.includes('Target IP:  198.51.100.5'));
+      assert.ok(cleanOut.includes('shield.unblock(\'198.51.100.5\')'));
 
       const logFile = path.join(tempDir, 'events.jsonl');
       const content = fs.readFileSync(logFile, 'utf8');
       assert.ok(content.includes('cli_unblock_requested'));
+    });
+  });
+
+  describe('Terminal Color Support & Accessibility', () => {
+    const originalEnv = { ...process.env };
+
+    afterEach(() => {
+      process.env = { ...originalEnv };
+    });
+
+    test('createColors(false) returns plain unstyled strings for all color helpers', () => {
+      const colors = createColors(false);
+      assert.equal(colors.red('error'), 'error');
+      assert.equal(colors.green('ok'), 'ok');
+      assert.equal(colors.yellow('warn'), 'warn');
+      assert.equal(colors.blue('info'), 'info');
+      assert.equal(colors.cyan('path'), 'path');
+      assert.equal(colors.gray('time'), 'time');
+      assert.equal(colors.bold('title'), 'title');
+      assert.equal(colors.dim('sub'), 'sub');
+      assert.equal(colors.inverse('badge'), 'badge');
+      assert.equal(colors.hasColors, false);
+    });
+
+    test('createColors(true) applies standard ANSI escape sequences', () => {
+      const colors = createColors(true);
+      assert.equal(colors.hasColors, true);
+      assert.equal(colors.red('error'), '\x1b[31merror\x1b[39m');
+      assert.equal(colors.green('ok'), '\x1b[32mok\x1b[39m');
+      assert.equal(colors.yellow('warn'), '\x1b[33mwarn\x1b[39m');
+      assert.equal(colors.cyan('path'), '\x1b[36mpath\x1b[39m');
+      assert.equal(colors.gray('time'), '\x1b[90mtime\x1b[39m');
+      assert.equal(colors.bold('title'), '\x1b[1mtitle\x1b[22m');
+    });
+
+    test('resolveColorSupport respects flags, environment variables, and TTY status', () => {
+      delete process.env.NO_COLOR;
+      delete process.env.NODE_DISABLE_COLORS;
+      delete process.env.FORCE_COLOR;
+
+      const ttyOutput = { isTTY: true };
+      const nonTtyOutput = { isTTY: false };
+
+      // Explicit --no-color flag disables colors even on TTY
+      assert.equal(resolveColorSupport({ 'no-color': true }, ttyOutput), false);
+      assert.equal(resolveColorSupport({ color: false }, ttyOutput), false);
+      assert.equal(resolveColorSupport({ color: 'false' }, ttyOutput), false);
+
+      // Explicit --color flag forces colors even on non-TTY
+      assert.equal(resolveColorSupport({ color: true }, nonTtyOutput), true);
+      assert.equal(resolveColorSupport({ color: 'true' }, nonTtyOutput), true);
+
+      // NO_COLOR standard disables colors
+      process.env.NO_COLOR = '1';
+      assert.equal(resolveColorSupport({}, ttyOutput), false);
+      delete process.env.NO_COLOR;
+
+      // NODE_DISABLE_COLORS disables colors
+      process.env.NODE_DISABLE_COLORS = '1';
+      assert.equal(resolveColorSupport({}, ttyOutput), false);
+      delete process.env.NODE_DISABLE_COLORS;
+
+      // FORCE_COLOR forces colors
+      try {
+        process.env.FORCE_COLOR = '1';
+        assert.equal(resolveColorSupport({}, nonTtyOutput), true);
+      } finally {
+        delete process.env.FORCE_COLOR;
+      }
+
+      // Default behavior: TTY is true, non-TTY is false
+      assert.equal(resolveColorSupport({}, ttyOutput), true);
+      assert.equal(resolveColorSupport({}, nonTtyOutput), false);
+    });
+  });
+
+  describe('Log Event Formatting & Graceful Degradation', () => {
+    test('handles empty or missing event fields gracefully with sensible fallbacks', () => {
+      const line = formatLogEvent({});
+      assert.ok(line.includes('UNKNOWN-TIME'));
+      assert.ok(line.includes('[INFO]'));
+      assert.ok(line.includes('GET'));
+      assert.ok(line.includes('/'));
+      assert.ok(line.includes('unknown'));
+      assert.ok(line.includes('No details'));
+    });
+
+    test('renders appropriate text badge for each action', () => {
+      assert.ok(formatLogEvent({ action: 'blocked' }).includes('[BLOCKED]'));
+      assert.ok(formatLogEvent({ action: 'warn' }).includes('[WARNED]'));
+      assert.ok(formatLogEvent({ action: 'allowed' }).includes('[ALLOWED]'));
+      assert.ok(formatLogEvent({ action: 'custom' }).includes('[CUSTOM]'));
+    });
+
+    test('strips hostile ANSI escapes from data even when color formatting is enabled', () => {
+      const hostileEvent = {
+        timestamp: '2026-10-19T12:00:00.000Z',
+        action: 'blocked',
+        ip: '198.51.100.99\x1b[2J\x1b[H',
+        method: 'POST',
+        route: '/admin\x1b[31;1mINJECTED',
+        reason: 'Malicious\x1b[0m payload'
+      };
+
+      const line = formatLogEvent(hostileEvent, { colors: true });
+      // Injected screen clear must not be present
+      assert.equal(line.includes('\x1b[2J'), false);
+      assert.equal(line.includes('\x1b[H'), false);
+      assert.equal(line.includes('INJECTED'), true);
+      // Controlled Z-Shield badge and color formatting is present
+      assert.ok(line.includes('[BLOCKED]'));
+      assert.ok(line.includes('\x1b[31m'));
+    });
+
+    test('produces zero ANSI escapes when colors: false', () => {
+      const event = {
+        timestamp: '2026-10-19T12:00:00.000Z',
+        action: 'blocked',
+        ip: '198.51.100.99',
+        method: 'POST',
+        route: '/admin/login',
+        reason: 'Rate limit exceeded'
+      };
+
+      const line = formatLogEvent(event, { colors: false });
+      assert.equal(line.includes('\x1b['), false);
+      assert.ok(line.includes('[BLOCKED]'));
+      assert.ok(line.includes('/admin/login'));
+    });
+  });
+
+  describe('Colored vs Plain Output Modes in CLI Commands', () => {
+    function createMockOutput() {
+      const logs = [];
+      const errors = [];
+      return {
+        log: (msg) => logs.push(String(msg)),
+        error: (msg) => errors.push(String(msg)),
+        getStdout: () => logs.join('\n'),
+        getStderr: () => errors.join('\n')
+      };
+    }
+
+    test('status command with --color outputs colored sections and badges', async () => {
+      const logFile = path.join(tempDir, 'events.jsonl');
+      fs.writeFileSync(
+        logFile,
+        JSON.stringify({
+          timestamp: '2026-10-19T12:00:00.000Z',
+          ip: '203.0.113.10',
+          type: 'rate_limit',
+          action: 'blocked',
+          route: '/api/v1/checkout'
+        }) + '\n'
+      );
+
+      const mock = createMockOutput();
+      const code = await runCommand(['status', '--color', '--log-dir', tempDir], mock);
+      assert.equal(code, 0);
+
+      const out = mock.getStdout();
+      // Should have ANSI codes
+      assert.ok(out.includes('\x1b['));
+      // Should have formatted sections and badges
+      assert.ok(out.includes('Z-Shield Security Status'));
+      assert.ok(out.includes('BLOCKED'));
+      assert.ok(out.includes('Process-Local Architecture Notice'));
+    });
+
+    test('status command with --no-color outputs zero ANSI codes while preserving badges', async () => {
+      const logFile = path.join(tempDir, 'events.jsonl');
+      fs.writeFileSync(
+        logFile,
+        JSON.stringify({
+          timestamp: '2026-10-19T12:00:00.000Z',
+          ip: '203.0.113.10',
+          type: 'rate_limit',
+          action: 'blocked',
+          route: '/api/v1/checkout'
+        }) + '\n'
+      );
+
+      const mock = createMockOutput();
+      const code = await runCommand(['status', '--no-color', '--log-dir', tempDir], mock);
+      assert.equal(code, 0);
+
+      const out = mock.getStdout();
+      // Must not contain any ANSI escapes
+      assert.equal(out.includes('\x1b['), false);
+      // Badges and text headers must still be readable
+      assert.ok(out.includes('Z-Shield Security Status'));
+      assert.ok(out.includes('BLOCKED'));
+      assert.ok(out.includes('Process-Local Architecture Notice'));
+    });
+
+    test('logs command outputs ANSI codes with --color and none with --no-color', async () => {
+      const logFile = path.join(tempDir, 'events.jsonl');
+      fs.writeFileSync(
+        logFile,
+        JSON.stringify({
+          timestamp: '2026-10-19T12:00:00.000Z',
+          ip: '203.0.113.10',
+          type: 'rate_limit',
+          action: 'blocked',
+          route: '/api/v1/checkout',
+          reason: 'Excessive requests'
+        }) + '\n'
+      );
+
+      const colorMock = createMockOutput();
+      await runCommand(['logs', '--color', '--log-dir', tempDir], colorMock);
+      assert.ok(colorMock.getStdout().includes('\x1b['));
+      assert.ok(colorMock.getStdout().includes('[BLOCKED]'));
+
+      const plainMock = createMockOutput();
+      await runCommand(['logs', '--no-color', '--log-dir', tempDir], plainMock);
+      assert.equal(plainMock.getStdout().includes('\x1b['), false);
+      assert.ok(plainMock.getStdout().includes('[BLOCKED]'));
+    });
+
+    test('command errors include [ERROR] prefix and respect --color / --no-color', async () => {
+      const colorMock = createMockOutput();
+      await runCommand(['block', 'not-an-ip', '--color'], colorMock);
+      assert.ok(colorMock.getStderr().includes('[ERROR]'));
+      assert.ok(colorMock.getStderr().includes('\x1b[31m')); // Red error
+
+      const plainMock = createMockOutput();
+      await runCommand(['block', 'not-an-ip', '--no-color'], plainMock);
+      assert.ok(plainMock.getStderr().includes('[ERROR]'));
+      assert.equal(plainMock.getStderr().includes('\x1b['), false); // No ANSI
     });
   });
 

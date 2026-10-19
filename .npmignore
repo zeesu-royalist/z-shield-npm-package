@@ -1,9 +1,12 @@
+# Development files (fallback for package.json "files" whitelist)
 test/
 examples/
+
+# Local logs and runtime data
 .z-shield-logs/
-.git/
-.github/
-.DS_Store
 *.log
 *.jsonl
+
+# Environment files
 .env
+.env.*

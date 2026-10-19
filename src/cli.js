@@ -64,27 +64,186 @@ function resolveLogPath(options = {}) {
 }
 
 /**
+ * Creates an ANSI color styling helper object.
+ * When enabled is false, all styling methods act as plain passthroughs.
+ *
+ * @param {boolean} [enabled=true]
+ * @returns {Record<string, (str: string|number) => string>}
+ */
+function createColors(enabled = true) {
+  if (!enabled) {
+    const pass = (str) => String(str ?? '');
+    return {
+      bold: pass,
+      dim: pass,
+      italic: pass,
+      underline: pass,
+      inverse: pass,
+      red: pass,
+      green: pass,
+      yellow: pass,
+      blue: pass,
+      magenta: pass,
+      cyan: pass,
+      white: pass,
+      gray: pass,
+      enabled: false,
+      hasColors: false
+    };
+  }
+
+  const wrap = (open, close) => (str) => `\x1b[${open}m${str ?? ''}\x1b[${close}m`;
+
+  return {
+    bold: wrap(1, 22),
+    dim: wrap(2, 22),
+    italic: wrap(3, 23),
+    underline: wrap(4, 24),
+    inverse: wrap(7, 27),
+    red: wrap(31, 39),
+    green: wrap(32, 39),
+    yellow: wrap(33, 39),
+    blue: wrap(34, 39),
+    magenta: wrap(35, 39),
+    cyan: wrap(36, 39),
+    white: wrap(37, 39),
+    gray: wrap(90, 39),
+    enabled: true,
+    hasColors: true
+  };
+}
+
+/**
+ * Determines whether terminal colors should be enabled based on
+ * explicit options, environment variables, and TTY capabilities.
+ *
+ * Respects the standard NO_COLOR specification (https://no-color.org).
+ *
+ * @param {Record<string, any>} [options={}]
+ * @param {Console|Object} [output=null]
+ * @returns {boolean}
+ */
+function resolveColorSupport(options = {}, output = null) {
+  // 1. Explicit CLI flags
+  if (
+    options['no-color'] ||
+    options.noColor ||
+    options.color === false ||
+    options.colors === false ||
+    options.color === 'false' ||
+    options.colors === 'false'
+  ) {
+    return false;
+  }
+  if (
+    options.color === true ||
+    options.colors === true ||
+    options.color === 'true' ||
+    options.colors === 'true' ||
+    options.color === ''
+  ) {
+    return true;
+  }
+
+  // 2. NO_COLOR standard (https://no-color.org)
+  if (process.env.NO_COLOR !== undefined && process.env.NO_COLOR !== '') {
+    return false;
+  }
+
+  // 3. Node.js NODE_DISABLE_COLORS
+  if (process.env.NODE_DISABLE_COLORS === '1') {
+    return false;
+  }
+
+  // 4. FORCE_COLOR override
+  if (process.env.FORCE_COLOR !== undefined) {
+    return process.env.FORCE_COLOR !== '0';
+  }
+
+  // 5. If output is a custom test mock or stream without TTY, disable colors by default
+  if (output && output !== console) {
+    return Boolean(output.isTTY);
+  }
+
+  // 6. Interactive terminal check
+  return Boolean(process.stdout && process.stdout.isTTY);
+}
+
+/**
  * Formats a single security event record into a clean, sanitized terminal line.
- * Strips all ANSI escapes and control characters from untrusted log fields.
+ * Strips all ANSI escapes and control characters from untrusted log fields before formatting.
  *
  * @param {Object} event
+ * @param {Object|boolean} [options={}] - Options object or boolean for color
  * @returns {string} Sanitized output line
  */
-function formatLogEvent(event) {
+function formatLogEvent(event, options = {}) {
   if (!event || typeof event !== 'object') {
     return '[Malformed Event]';
   }
 
+  let useColors = false;
+  if (typeof options === 'boolean') {
+    useColors = options;
+  } else if (options && typeof options === 'object') {
+    if (typeof options.colors === 'boolean') {
+      useColors = options.colors;
+    } else if (typeof options.color === 'boolean') {
+      useColors = options.color;
+    } else if (options.colors === 'true' || options.color === 'true') {
+      useColors = true;
+    } else if (options.colors === 'false' || options.color === 'false' || options['no-color']) {
+      useColors = false;
+    }
+  }
+  const c = createColors(useColors);
+
+  // Sanitize untrusted log values first to prevent terminal injection
   const timestamp = sanitizeString(event.timestamp || 'UNKNOWN-TIME', 30);
   const severity = sanitizeString((event.severity || 'INFO').toUpperCase(), 10);
   const type = sanitizeString(event.type || 'unknown', 20);
-  const action = sanitizeString((event.action || 'unknown').toUpperCase(), 10);
+  const rawAction = (event.action || 'unknown').toUpperCase();
+  const normalizedAction = rawAction === 'WARN' ? 'WARNED'
+    : rawAction === 'BLOCK' ? 'BLOCKED'
+    : rawAction === 'ALLOW' ? 'ALLOWED'
+    : rawAction;
+  const action = sanitizeString(normalizedAction, 10);
   const ip = sanitizeString(event.ip || 'unknown', 45);
   const method = sanitizeString((event.method || 'GET').toUpperCase(), 10);
   const route = sanitizeString(event.route || '/', 100);
   const reason = sanitizeString(event.reason || 'No details', 150);
 
-  return `[${timestamp}] [${severity}] [${action}] ${method} ${route} | IP: ${ip} | ${type}: ${reason}`;
+  if (!useColors) {
+    return `[${timestamp}] [${severity}] [${action}] ${method} ${route} | IP: ${ip} | ${type}: ${reason}`;
+  }
+
+  // Action badge with semantic color
+  let styledAction;
+  switch (action) {
+    case 'BLOCKED': styledAction = c.bold(c.red(`[${action}]`)); break;
+    case 'WARNED': styledAction = c.bold(c.yellow(`[${action}]`)); break;
+    case 'ALLOWED': styledAction = c.bold(c.green(`[${action}]`)); break;
+    case 'UNBLOCKED': styledAction = c.bold(c.cyan(`[${action}]`)); break;
+    case 'REQUESTED': styledAction = c.bold(c.blue(`[${action}]`)); break;
+    default: styledAction = c.bold(`[${action}]`); break;
+  }
+
+  // Severity badge with semantic color
+  let styledSeverity;
+  switch (severity) {
+    case 'CRITICAL': styledSeverity = c.bold(c.red(`[${severity}]`)); break;
+    case 'WARNING': styledSeverity = c.bold(c.yellow(`[${severity}]`)); break;
+    case 'INFO': styledSeverity = c.bold(c.green(`[${severity}]`)); break;
+    default: styledSeverity = c.bold(`[${severity}]`); break;
+  }
+
+  const styledTimestamp = c.gray(`[${timestamp}]`);
+  const styledMethod = c.bold(method);
+  const styledRoute = c.cyan(route);
+  const styledIp = c.bold(ip);
+  const styledType = c.yellow(type);
+
+  return `${styledTimestamp} ${styledSeverity} ${styledAction} ${styledMethod} ${styledRoute} | IP: ${styledIp} | ${styledType}: ${reason}`;
 }
 
 /**
@@ -187,53 +346,67 @@ function calculateStatus(logFilePath) {
 async function runCommand(argv = process.argv.slice(2), output = console) {
   const { command, args, options } = parseCliArgs(argv);
   const logFilePath = resolveLogPath(options);
+  const useColors = resolveColorSupport(options, output);
+  const c = createColors(useColors);
 
   switch (command) {
     case 'status': {
-      output.log('====================================================');
-      output.log('🛡️  Z-Shield Security Status');
-      output.log('====================================================');
-      output.log(`Log File: ${logFilePath}`);
+      output.log(c.cyan('\n\n===================================================='));
+      output.log(c.bold(c.cyan('🛡️  Z-Shield Security Status')));
+      output.log(c.cyan('===================================================='));
+      output.log(`${c.bold('Log File:')} ${c.gray(logFilePath)}`);
 
       const status = calculateStatus(logFilePath);
 
       if (!status.fileExists) {
-        output.log('Status:   No log file found yet.');
-        output.log('ℹ Start your Express server to begin logging security events.');
-        output.log('====================================================');
+        output.log(`${c.bold('Status:')}   ${c.yellow('No log file found yet.')}`);
+        output.log(c.dim('ℹ Start your Express server to begin logging security events.'));
+        output.log(c.cyan('====================================================\n'));
         return 0;
       }
 
-      output.log(`Total Events Recorded: ${status.totalEvents}`);
+      output.log(`${c.bold('Total Events Recorded:')} ${c.bold(c.cyan(status.totalEvents))}`);
       if (status.malformedCount > 0) {
-        output.log(`Malformed Lines Skipped: ${status.malformedCount}`);
+        output.log(`${c.bold(c.yellow('⚠️  Malformed Lines Skipped:'))} ${c.yellow(status.malformedCount)}`);
       }
 
-      output.log('\nActions Breakdown:');
+      output.log(`\n${c.bold('Actions Breakdown:')}`);
       for (const [action, count] of Object.entries(status.actionCounts)) {
-        output.log(`  - ${action.toUpperCase()}: ${count}`);
+        const upper = action.toUpperCase();
+        let styledAction = upper;
+        if (upper === 'BLOCKED') styledAction = c.bold(c.red(upper));
+        else if (upper === 'WARNED') styledAction = c.bold(c.yellow(upper));
+        else if (upper === 'ALLOWED') styledAction = c.bold(c.green(upper));
+        else if (upper === 'UNBLOCKED') styledAction = c.bold(c.cyan(upper));
+        else if (upper === 'REQUESTED') styledAction = c.bold(c.blue(upper));
+        output.log(`  - ${styledAction}: ${c.bold(count)}`);
       }
 
-      output.log('\nEvent Types:');
+      output.log(`\n${c.bold('Event Types:')}`);
       for (const [type, count] of Object.entries(status.typeCounts)) {
-        output.log(`  - ${type}: ${count}`);
+        output.log(`  - ${c.yellow(type)}: ${c.bold(count)}`);
       }
 
       if (status.topIps.length > 0) {
-        output.log('\nTop Offending IPs:');
+        output.log(`\n${c.bold('Top Offending IPs:')}`);
         for (const item of status.topIps) {
-          output.log(`  - ${item.ip}: ${item.count} events`);
+          output.log(`  - ${c.cyan(item.ip)}: ${c.bold(item.count)} events`);
         }
       }
 
       if (status.topRoutes.length > 0) {
-        output.log('\nTop Targeted Routes:');
+        output.log(`\n${c.bold('Top Targeted Routes:')}`);
         for (const item of status.topRoutes) {
-          output.log(`  - ${item.route}: ${item.count} events`);
+          output.log(`  - ${c.underline(item.route)}: ${c.bold(item.count)} events`);
         }
       }
 
-      output.log('====================================================');
+      output.log(`\n${c.dim('ℹ Process-Local Architecture Notice:')}`);
+      output.log(c.dim('Statistics reflect historical events recorded in the local log file.'));
+      output.log(c.dim('Active in-memory counters and temporary blocks reside in server RAM'));
+      output.log(c.dim('and are managed inside the running Express process.'));
+
+      output.log(c.cyan('===================================================='));
       return 0;
     }
 
@@ -242,7 +415,7 @@ async function runCommand(argv = process.argv.slice(2), output = console) {
       if (options.limit) {
         const parsed = parseInt(options.limit, 10);
         if (isNaN(parsed) || parsed <= 0) {
-          output.error('❌ Error: --limit must be a positive integer.');
+          output.error(c.bold(c.red('[ERROR] --limit must be a positive integer.')));
           return 1;
         }
         limit = parsed;
@@ -250,35 +423,35 @@ async function runCommand(argv = process.argv.slice(2), output = console) {
 
       const { events, totalLines, malformedCount, fileExists } = readLogs(logFilePath, limit);
 
-      output.log('====================================================');
-      output.log(`🛡️  Z-Shield Security Logs (Showing last ${events.length} of ${totalLines} events)`);
-      output.log(`Source: ${logFilePath}`);
-      output.log('====================================================');
+      output.log(c.cyan('\n\n===================================================='));
+      output.log(c.bold(c.cyan(`🛡️  Z-Shield Security Logs (Showing last ${events.length} of ${totalLines} events)`)));
+      output.log(`${c.bold('Source:')} ${c.gray(logFilePath)}`);
+      output.log(c.cyan('===================================================='));
 
       if (!fileExists || events.length === 0) {
-        output.log('ℹ No security events found in log file.');
-        output.log('====================================================');
+        output.log(c.dim('ℹ No security events found in log file.'));
+        output.log(c.cyan('===================================================='));
         return 0;
       }
 
       for (const event of events) {
-        output.log(formatLogEvent(event));
+        output.log(formatLogEvent(event, { colors: useColors }));
       }
 
       if (malformedCount > 0) {
-        output.log(`\n⚠️  Notice: Skipped ${malformedCount} unparseable or corrupted lines.`);
+        output.log(`\n${c.yellow(`⚠️  Notice: Skipped ${malformedCount} unparseable or corrupted lines.`)}`);
       }
 
-      output.log('====================================================');
+      output.log(c.cyan('===================================================='));
       return 0;
     }
 
     case 'monitor': {
-      output.log('====================================================');
-      output.log('🛡️  Z-Shield Live Security Event Monitor');
-      output.log(`Watching: ${logFilePath}`);
-      output.log('Press Ctrl+C to exit.');
-      output.log('====================================================');
+      output.log(c.cyan('\n\n===================================================='));
+      output.log(c.bold(c.cyan('🛡️  Z-Shield Live Security Event Monitor')));
+      output.log(`${c.bold('Watching:')} ${c.gray(logFilePath)}`);
+      output.log(c.dim('Press Ctrl+C to exit.'));
+      output.log(c.cyan('===================================================='));
 
       let currentSize = 0;
       if (fs.existsSync(logFilePath)) {
@@ -286,14 +459,14 @@ async function runCommand(argv = process.argv.slice(2), output = console) {
         // Show recent events for immediate context
         const { events } = readLogs(logFilePath, 5);
         if (events.length > 0) {
-          output.log('--- Recent Events ---');
+          output.log(c.dim('--- Recent Events ---'));
           for (const ev of events) {
-            output.log(formatLogEvent(ev));
+            output.log(formatLogEvent(ev, { colors: useColors }));
           }
-          output.log('--- Live Stream Active ---');
+          output.log(c.dim('--- Live Stream Active ---'));
         }
       } else {
-        output.log('ℹ Waiting for server to create log file...');
+        output.log(c.dim('ℹ Waiting for server to create log file...'));
       }
 
       // Live watcher polling function
@@ -321,9 +494,9 @@ async function runCommand(argv = process.argv.slice(2), output = console) {
                 if (line.trim().length > 0) {
                   try {
                     const parsed = JSON.parse(line);
-                    output.log(formatLogEvent(parsed));
+                    output.log(formatLogEvent(parsed, { colors: useColors }));
                   } catch {
-                    output.log('[⚠️ Corrupted log record]');
+                    output.log(c.yellow('[⚠️ Corrupted log record]'));
                   }
                 }
               }
@@ -344,7 +517,7 @@ async function runCommand(argv = process.argv.slice(2), output = console) {
       return new Promise((resolve) => {
         const cleanup = () => {
           clearInterval(interval);
-          output.log('\n👋 Exiting Z-Shield live monitor.');
+          output.log(`\n${c.cyan('👋 Exiting Z-Shield live monitor.')}`);
           resolve(0);
         };
 
@@ -356,12 +529,12 @@ async function runCommand(argv = process.argv.slice(2), output = console) {
     case 'block': {
       const ip = args[0];
       if (!ip) {
-        output.error('❌ Error: Missing IP address. Usage: npx z-shield block <ip> [--duration 10m] [--reason <text>]');
+        output.error(c.bold(c.red('[ERROR] Missing IP address. Usage: npx z-shield block <ip> [--duration 10m] [--reason <text>]')));
         return 1;
       }
 
       if (!isValidIp(ip)) {
-        output.error(`❌ Error: Invalid IP address "${ip}". Must be a valid IPv4 or IPv6 address.`);
+        output.error(c.bold(c.red(`[ERROR] Invalid IP address "${ip}". Must be a valid IPv4 or IPv6 address.`)));
         return 1;
       }
 
@@ -370,25 +543,25 @@ async function runCommand(argv = process.argv.slice(2), output = console) {
       try {
         durationMs = parseDuration(durationRaw);
       } catch (err) {
-        output.error(`❌ Error: ${err.message}`);
+        output.error(c.bold(c.red(`[ERROR] ${err.message}`)));
         return 1;
       }
 
       const reason = options.reason || 'Manual block requested via CLI';
 
-      output.log('====================================================');
-      output.log('🛡️  Z-Shield CLI: Block Request');
-      output.log('====================================================');
-      output.log(`Target IP:  ${ip}`);
-      output.log(`Duration:   ${durationRaw} (${durationMs.toLocaleString()}ms)`);
-      output.log(`Reason:     ${reason}`);
-      output.log('\nℹ Process-Local Architecture Notice:');
-      output.log('Z-Shield manages active temporary blocks in server memory (RAM).');
-      output.log('Because this CLI runs in an independent Node.js process, it cannot');
-      output.log('directly modify the running Express server\'s memory heap without an');
-      output.log('external IPC socket or database (which Z-Shield intentionally avoids).');
-      output.log('\nTo block this IP in your running Express application:');
-      output.log(`  shield.block('${ip}', '${durationRaw}', '${reason}');`);
+      output.log(c.cyan('\n\n===================================================='));
+      output.log(c.bold(c.cyan('🛡️  Z-Shield CLI: Block Request')));
+      output.log(c.cyan('===================================================='));
+      output.log(`${c.bold('Target IP:')}  ${c.bold(c.cyan(ip))}`);
+      output.log(`${c.bold('Duration:')}   ${c.yellow(durationRaw)} (${durationMs.toLocaleString()}ms)`);
+      output.log(`${c.bold('Reason:')}     ${reason}`);
+      output.log(`\n${c.bold(c.yellow('ℹ Process-Local Architecture Notice:'))}`);
+      output.log(c.dim('Z-Shield manages active temporary blocks in server memory (RAM).'));
+      output.log(c.dim('Because this CLI runs in an independent Node.js process, it cannot'));
+      output.log(c.dim("directly modify the running Express server's memory heap without an"));
+      output.log(c.dim('external IPC socket or database (which Z-Shield intentionally avoids).'));
+      output.log(`\n${c.bold('To block this IP in your running Express application:')}`);
+      output.log(c.green(`  shield.block('${ip}', '${durationRaw}', '${reason}');`));
 
       // Record an audit log event
       try {
@@ -405,35 +578,35 @@ async function runCommand(argv = process.argv.slice(2), output = console) {
           action: 'requested'
         };
         fs.appendFileSync(logFilePath, JSON.stringify(auditEvent) + '\n');
-        output.log(`\nAudit entry recorded in: ${logFilePath}`);
+        output.log(`\n${c.green('✔')} Audit entry recorded in: ${c.gray(logFilePath)}`);
       } catch {
         // Safe fallback
       }
 
-      output.log('====================================================');
+      output.log(c.cyan('===================================================='));
       return 0;
     }
 
     case 'unblock': {
       const ip = args[0];
       if (!ip) {
-        output.error('❌ Error: Missing IP address. Usage: npx z-shield unblock <ip>');
+        output.error(c.bold(c.red('[ERROR] Missing IP address. Usage: npx z-shield unblock <ip>')));
         return 1;
       }
 
       if (!isValidIp(ip)) {
-        output.error(`❌ Error: Invalid IP address "${ip}". Must be a valid IPv4 or IPv6 address.`);
+        output.error(c.bold(c.red(`[ERROR] Invalid IP address "${ip}". Must be a valid IPv4 or IPv6 address.`)));
         return 1;
       }
 
-      output.log('====================================================');
-      output.log('🛡️  Z-Shield CLI: Unblock Request');
-      output.log('====================================================');
-      output.log(`Target IP:  ${ip}`);
-      output.log('\nℹ Process-Local Architecture Notice:');
-      output.log('Z-Shield manages active temporary blocks in server memory (RAM).');
-      output.log('\nTo unblock this IP in your running Express application:');
-      output.log(`  shield.unblock('${ip}');`);
+      output.log(c.cyan('\n\n===================================================='));
+      output.log(c.bold(c.cyan('🛡️  Z-Shield CLI: Unblock Request')));
+      output.log(c.cyan('===================================================='));
+      output.log(`${c.bold('Target IP:')}  ${c.bold(c.cyan(ip))}`);
+      output.log(`\n${c.bold(c.yellow('ℹ Process-Local Architecture Notice:'))}`);
+      output.log(c.dim('Z-Shield manages active temporary blocks in server memory (RAM).'));
+      output.log(`\n${c.bold('To unblock this IP in your running Express application:')}`);
+      output.log(c.green(`  shield.unblock('${ip}');`));
 
       // Record an audit log event
       try {
@@ -450,32 +623,37 @@ async function runCommand(argv = process.argv.slice(2), output = console) {
           action: 'requested'
         };
         fs.appendFileSync(logFilePath, JSON.stringify(auditEvent) + '\n');
-        output.log(`\nAudit entry recorded in: ${logFilePath}`);
+        output.log(`\n${c.green('✔')} Audit entry recorded in: ${c.gray(logFilePath)}`);
       } catch {
         // Safe fallback
       }
 
-      output.log('====================================================');
+      output.log(c.cyan('===================================================='));
       return 0;
     }
 
     case 'help':
     default: {
-      output.log('====================================================');
-      output.log('🛡️  Z-Shield CLI — API Abuse Detection & Protection');
-      output.log('====================================================');
-      output.log('Usage:');
-      output.log('  npx z-shield status                Show security overview and top offender IPs');
-      output.log('  npx z-shield logs [--limit 50]     Display recent security event logs');
-      output.log('  npx z-shield monitor               Stream security events in real time');
-      output.log('  npx z-shield block <ip>            Instructions & audit for blocking an IP');
-      output.log('  npx z-shield unblock <ip>          Instructions & audit for unblocking an IP');
-      output.log('\nOptions:');
-      output.log('  --limit <number>                   Number of log entries to display (default: 20)');
-      output.log('  --duration <time>                  Block duration (e.g. 10m, 1h, 30s)');
-      output.log('  --log-dir <path>                   Path to log directory (default: .z-shield-logs)');
-      output.log('  --help, -h                         Display this help message');
-      output.log('====================================================');
+      output.log(c.cyan('\n\n===================================================='));
+      output.log(c.bold(c.cyan('🛡️  Z-Shield CLI — API Abuse Detection & Protection')));
+      output.log(c.cyan('===================================================='));
+      output.log(c.bold('Usage:'));
+      output.log(`  ${c.bold('npx z-shield')} ${c.cyan('<command>')} [options]`);
+      output.log(`\n${c.bold('Commands:')}`);
+      output.log(`  ${c.bold('npx z-shield status')}                Show security overview and top offender IPs`);
+      output.log(`  ${c.bold('npx z-shield logs')} [--limit 50]     Display recent security event logs`);
+      output.log(`  ${c.bold('npx z-shield monitor')}               Stream security events in real time`);
+      output.log(`  ${c.bold('npx z-shield block')} <ip>            Instructions & audit for blocking an IP`);
+      output.log(`  ${c.bold('npx z-shield unblock')} <ip>          Instructions & audit for unblocking an IP`);
+      output.log(`\n${c.bold('Options:')}`);
+      output.log(`  ${c.yellow('--limit')} <number>                   Number of log entries to display (default: 20)`);
+      output.log(`  ${c.yellow('--duration')} <time>                  Block duration (e.g. 10m, 1h, 30s)`);
+      output.log(`  ${c.yellow('--reason')} <text>                    Reason for manual block`);
+      output.log(`  ${c.yellow('--log-dir')} <path>                   Path to log directory (default: .z-shield-logs)`);
+      output.log(`  ${c.yellow('--color')}                            Force enable colored terminal output`);
+      output.log(`  ${c.yellow('--no-color')}                         Disable colored terminal output`);
+      output.log(`  ${c.yellow('--help, -h')}                         Display this help message`);
+      output.log(c.cyan('===================================================='));
       return command === 'help' ? 0 : 1;
     }
   }
@@ -491,6 +669,8 @@ if (require.main === module) {
 }
 
 module.exports = {
+  createColors,
+  resolveColorSupport,
   parseCliArgs,
   formatLogEvent,
   readLogs,
