@@ -43,6 +43,6 @@ jobs:
 
       - name: Verify package tarball creation
         run: |
-          TARBALL=$(npm pack)
+          TARBALL=$(npm pack --ignore-scripts | tail -n 1)
           echo "Created tarball: $TARBALL"
           test -f "$TARBALL"
