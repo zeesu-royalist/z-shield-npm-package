@@ -69,11 +69,16 @@ export function parseCliArgs(argv: string[] = []): ParsedCliArgs {
   // If first non-flag argument exists, it's the command
   while (i < argv.length) {
     const token = argv[i];
+    if (!token) {
+      i += 1;
+      continue;
+    }
     if (token.startsWith('--') || token.startsWith('-')) {
       const cleanKey = token.replace(/^-+/, '');
+      const nextToken = argv[i + 1];
       // Check if next token is value
-      if (i + 1 < argv.length && !argv[i + 1].startsWith('-')) {
-        options[cleanKey] = argv[i + 1];
+      if (nextToken !== undefined && !nextToken.startsWith('-')) {
+        options[cleanKey] = nextToken;
         i += 2;
       } else {
         options[cleanKey] = true;
@@ -121,9 +126,19 @@ export function resolveLogPath(options: Record<string, unknown> = {}): string {
   }
 
   const logDir = path.resolve(targetDir);
-  const filename = typeof filenameOption === 'string' && filenameOption.trim().length > 0
-    ? filenameOption.trim()
-    : 'events.jsonl';
+  let filename = 'events.jsonl';
+  if (typeof filenameOption === 'string' && filenameOption.trim().length > 0) {
+    const candidate = filenameOption.trim();
+    if (
+      !/^[a-zA-Z0-9._-]+$/.test(candidate) ||
+      candidate.includes('..') ||
+      candidate.includes('/') ||
+      candidate.includes('\\')
+    ) {
+      throw new Error('[Z-Shield CLI] "--log-file" must be a safe filename without path traversal characters.');
+    }
+    filename = candidate;
+  }
 
   return path.join(logDir, filename);
 }
@@ -377,13 +392,13 @@ export function sanitizeIp(rawIp: unknown): string {
     return normalizeIp(stripped);
   }
 
-  const beforeEscape = trimmed.split(/[\x1b\r\n\x00-\x1f\x7f]/)[0].trim();
+  const beforeEscape = (trimmed.split(/[\x1b\r\n\x00-\x1f\x7f]/)[0] ?? '').trim();
   if (beforeEscape.length > 0 && net.isIP(beforeEscape) !== 0) {
     return normalizeIp(beforeEscape);
   }
 
   const ipv4Match = stripped.match(/(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)/);
-  if (ipv4Match && net.isIP(ipv4Match[0]) === 4) {
+  if (ipv4Match && ipv4Match[0] && net.isIP(ipv4Match[0]) === 4) {
     return normalizeIp(ipv4Match[0]);
   }
 
@@ -408,7 +423,7 @@ export function sanitizeIp(rawIp: unknown): string {
  */
 export function sanitizeType(rawType: unknown, maxLength: number = 30): string {
   if (!rawType || typeof rawType !== 'string') return 'unknown';
-  let clean = rawType.split(/[\r\n\x1b]/)[0];
+  let clean = rawType.split(/[\r\n\x1b]/)[0] ?? '';
   clean = stripAnsi(clean);
   clean = clean.replace(/[\x00-\x1f\x7f]/g, ' ').trim();
   clean = clean.replace(/\s+/g, ' ');
@@ -424,7 +439,7 @@ export function sanitizeType(rawType: unknown, maxLength: number = 30): string {
  */
 export function sanitizeAction(rawAction: unknown, maxLength: number = 20): string {
   if (!rawAction || typeof rawAction !== 'string') return 'unknown';
-  let clean = rawAction.split(/[\r\n\x1b]/)[0];
+  let clean = rawAction.split(/[\r\n\x1b]/)[0] ?? '';
   clean = stripAnsi(clean);
   clean = clean.replace(/[\x00-\x1f\x7f]/g, '').trim().toLowerCase();
   if (clean === 'warn') clean = 'warned';
@@ -642,27 +657,32 @@ export async function runCommand(
         output.log(c.dim('  Tip: You can specify a custom directory with --log-dir <path> or Z_SHIELD_LOG_DIR=<path>.'));
       }
 
-      // Live watcher polling function
+      // Live watcher polling function state
+      let isReading = false;
+      let partialLine = '';
+
       const checkNewLines = () => {
-        if (!fs.existsSync(logFilePath)) {
+        if (!fs.existsSync(logFilePath) || isReading) {
           return;
         }
         try {
           const stats = fs.statSync(logFilePath);
           if (stats.size > currentSize) {
+            isReading = true;
+            const readStart = currentSize;
+            const readEnd = stats.size;
+            currentSize = readEnd;
+
             const stream = fs.createReadStream(logFilePath, {
-              start: currentSize,
-              end: stats.size,
+              start: readStart,
+              end: readEnd,
               encoding: 'utf8'
             });
 
-            currentSize = stats.size;
-
-            let buffer = '';
             stream.on('data', chunk => {
-              buffer += chunk;
-              const lines = buffer.split('\n');
-              buffer = lines.pop() || ''; // keep last partial line
+              partialLine += chunk;
+              const lines = partialLine.split('\n');
+              partialLine = lines.pop() ?? ''; // keep last partial line
               for (const line of lines) {
                 if (line.trim().length > 0) {
                   try {
@@ -674,12 +694,21 @@ export async function runCommand(
                 }
               }
             });
+
+            stream.on('end', () => {
+              isReading = false;
+            });
+
+            stream.on('error', () => {
+              isReading = false;
+            });
           } else if (stats.size < currentSize) {
             // File was rotated or truncated!
             currentSize = 0;
+            partialLine = '';
           }
         } catch {
-          // Non-fatal read error
+          isReading = false;
         }
       };
 

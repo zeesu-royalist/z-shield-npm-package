@@ -225,6 +225,9 @@ const shield = createShield({
   // Array of route prefixes that bypass tracking
   excludeRoutes: ['/health', '/favicon.ico'],
 
+  // Maximum number of pending asynchronous log writes allowed in memory before dropping
+  maxLogQueueSize: 1000,
+
   // Optional custom error callback for failed log writes: (err, event) => void
   onLogError: null
 });
@@ -418,6 +421,37 @@ In Next.js App Router route handlers, standard Web `Request` objects do not carr
      - Custom extractor: `(req: Request) => string | null | undefined`.
    - **Crucial Reverse-Proxy Requirement**: When using `'x-forwarded-for'` with an appending reverse proxy (such as default Nginx `$proxy_add_x_forwarded_for`), your edge proxy **MUST** strip client-supplied `X-Forwarded-For` headers at network ingress; otherwise, an attacker can prepend a forged IP. If your proxy cannot strip incoming headers, configure `'x-real-ip'` or provide a custom `getIp` function.
    - **Fail-Safe Behavior**: If `trustProxy: true` is configured without specifying `getIp`, Z-Shield strictly refuses to guess which header is authentic, and safely falls back to `'unknown'` (or direct TCP socket if available). Unconfigured reverse-proxy headers and unverified platform properties are never trusted.
+
+> [!WARNING]
+> **CRITICAL: The Serverless `'unknown'` Shared Bucket Trap**
+>
+> In serverless environments (Vercel Serverless Functions, AWS Lambda, Cloudflare Pages), requests arrive without an underlying direct Node.js TCP socket.
+>
+> If you leave `trustProxy: false` (or set `trustProxy: true` without a valid `getIp`), all incoming client IPs evaluate to `'unknown'`. Consequently, **all global visitors share one single rate-limit counter**. If `maxRequests` is exceeded or `autoBlock: true` triggers on `'unknown'`, **EVERY visitor worldwide will receive HTTP 429**, causing a self-inflicted Denial of Service (DoS) of your entire serverless API.
+>
+> **Remedy**: Always set `trustProxy: true` and specify the `getIp` strategy matching your hosting infrastructure:
+>
+> ```typescript
+> // Vercel: Vercel edge strips/sanitizes X-Forwarded-For at ingress
+> getIp: 'x-forwarded-for' // or 'x-real-ip'
+>
+> // Cloudflare: When application is strictly behind Cloudflare
+> getIp: 'cloudflare' // strictly inspects CF-Connecting-IP
+>
+> // AWS CloudFront / ALB:
+> getIp: (req) => req.headers.get('cloudfront-viewer-address')?.split(':')[0]
+>   || req.headers.get('x-forwarded-for')?.split(',')[0]?.trim()
+>
+> // Nginx Reverse Proxy (configured with proxy_set_header X-Real-IP $remote_addr):
+> getIp: 'nginx' // strictly inspects X-Real-IP
+> ```
+
+> [!CAUTION]
+> **Proxy Headers Are Trustworthy ONLY When Your Infrastructure Sanitizes Them**
+>
+> **No single proxy strategy is safe for every hosting provider!** HTTP headers (`CF-Connecting-IP`, `X-Real-IP`, `X-Forwarded-For`, `True-Client-IP`) are untrusted client metadata unless your hosting proxy explicitly sets or sanitizes them.
+>
+> Never configure a strategy that does not match your actual ingress infrastructure (e.g. configuring `getIp: 'cloudflare'` on AWS or Bare Metal without Cloudflare allows anyone on the internet to send a forged `CF-Connecting-IP` header). Furthermore, always ensure direct origin access is firewalled so traffic cannot bypass your proxy.
 
 ---
 

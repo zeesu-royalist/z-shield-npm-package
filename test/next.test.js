@@ -245,6 +245,37 @@ describe('Next.js App Router Compatibility Adapter', () => {
       };
       assert.equal(extractNextClientIp(req, true, throwingExtractor), 'unknown');
     });
+
+    test('case-insensitivity on plain object headers across different proxy strategies', () => {
+      // Plain object with capitalized / mixed-case headers
+      const plainReqXFF = {
+        headers: {
+          'X-Forwarded-For': '198.51.100.33, 10.0.0.1'
+        }
+      };
+      assert.equal(extractNextClientIp(plainReqXFF, true, 'x-forwarded-for'), '198.51.100.33');
+
+      const plainReqRealIp = {
+        headers: {
+          'X-Real-IP': '198.51.100.34'
+        }
+      };
+      assert.equal(extractNextClientIp(plainReqRealIp, true, 'nginx'), '198.51.100.34');
+
+      const plainReqCF = {
+        headers: {
+          'CF-Connecting-IP': '198.51.100.35'
+        }
+      };
+      assert.equal(extractNextClientIp(plainReqCF, true, 'cloudflare'), '198.51.100.35');
+
+      const plainReqTrueClient = {
+        headers: {
+          'True-Client-IP': '198.51.100.36'
+        }
+      };
+      assert.equal(extractNextClientIp(plainReqTrueClient, true, 'akamai'), '198.51.100.36');
+    });
   });
 
   describe('Route Exclusion', () => {
@@ -442,6 +473,31 @@ describe('Next.js App Router Compatibility Adapter', () => {
       const res = await handler(req);
       assert.equal(res.status, 204);
       assert.equal(res.headers.get('X-Z-Shield-Protected'), '1');
+    });
+
+    test('handles 205, 304, and 101 responses safely without body error when merging headers', async () => {
+      const shield = trackShield(createNextShield({
+        mode: 'protect',
+        trustProxy: true,
+        getIp: 'x-forwarded-for',
+        logDir: tempLogDir
+      }));
+
+      // Test 304 Not Modified
+      const handler304 = shield.protect(async () => new Response(null, { status: 304 }));
+      const res304 = await handler304(new Request('http://localhost/api/test', {
+        headers: { 'x-forwarded-for': '198.51.100.8' }
+      }));
+      assert.equal(res304.status, 304);
+      assert.equal(res304.headers.get('X-Z-Shield-Protected'), '1');
+
+      // Test 205 Reset Content
+      const handler205 = shield.protect(async () => new Response(null, { status: 205 }));
+      const res205 = await handler205(new Request('http://localhost/api/test', {
+        headers: { 'x-forwarded-for': '198.51.100.9' }
+      }));
+      assert.equal(res205.status, 205);
+      assert.equal(res205.headers.get('X-Z-Shield-Protected'), '1');
     });
 
     test('supports custom 429 block response builder', async () => {

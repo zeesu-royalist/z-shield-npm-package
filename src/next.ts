@@ -22,6 +22,7 @@ import type {
   NextShieldOptions,
   NextShieldCheckResult,
   NextShieldInstance,
+  NextRouteHandler,
   NextClientIpStrategy,
   NextClientIpExtractor
 } from './types';
@@ -37,7 +38,16 @@ function getHeader(request: Request | NextLikeRequest, name: string): string | n
     return (request.headers as Headers).get(name);
   }
   const headersObj = request.headers as Record<string, string | string[] | undefined>;
-  const val = headersObj[name] ?? headersObj[name.toLowerCase()];
+  const lowerName = name.toLowerCase();
+  let val = headersObj[name] ?? headersObj[lowerName];
+  if (val === undefined) {
+    for (const key of Object.keys(headersObj)) {
+      if (key.toLowerCase() === lowerName) {
+        val = headersObj[key];
+        break;
+      }
+    }
+  }
   if (Array.isArray(val)) {
     return val[0] ?? null;
   }
@@ -183,7 +193,7 @@ function extractRequestPath(request: Request | NextLikeRequest): string {
     const parsed = new URL(request.url, 'http://localhost');
     return parsed.pathname;
   } catch {
-    return request.url.split('?')[0].split('#')[0] || '/';
+    return (request.url.split('?')[0] ?? '').split('#')[0] || '/';
   }
 }
 
@@ -209,8 +219,9 @@ function mergeResponseHeaders(
       newHeaders.set(key, value);
     }
 
+    const nullBodyStatuses = [101, 204, 205, 304];
     const body =
-      response.status === 204 || response.status === 205 || response.status === 304
+      nullBodyStatuses.includes(response.status)
         ? null
         : response.body;
 
@@ -570,3 +581,14 @@ export function withNextShield<TContext = unknown>(
 
   return shield.protect(handler);
 }
+
+export type {
+  NextShieldOptions,
+  NextShieldCheckResult,
+  NextShieldInstance,
+  NextRouteHandler,
+  NextClientIpStrategy,
+  NextClientIpExtractor,
+  NextLikeRequest
+};
+

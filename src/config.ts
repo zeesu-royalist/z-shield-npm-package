@@ -51,6 +51,9 @@ export const DEFAULT_CONFIG: ZShieldConfig = {
   // Maximum number of rotated log files to retain
   maxLogFiles: 5,
 
+  // Maximum number of pending asynchronous log writes allowed in memory before dropping
+  maxLogQueueSize: 1000,
+
   // Optional custom error callback: (err, event) => void
   onLogError: null
 };
@@ -157,6 +160,11 @@ export function resolveConfig(userConfig: ZShieldOptions | ZShieldConfig = {}): 
   // Validate maxLogFiles
   if (typeof rawConfig.maxLogFiles !== 'number' || !Number.isInteger(rawConfig.maxLogFiles) || rawConfig.maxLogFiles < 0) {
     throw new TypeError('[Z-Shield] "maxLogFiles" must be a non-negative integer.');
+  }
+
+  // Validate maxLogQueueSize
+  if (typeof rawConfig.maxLogQueueSize !== 'number' || !Number.isInteger(rawConfig.maxLogQueueSize) || rawConfig.maxLogQueueSize <= 0) {
+    throw new TypeError('[Z-Shield] "maxLogQueueSize" must be a positive integer.');
   }
 
   // Validate onLogError

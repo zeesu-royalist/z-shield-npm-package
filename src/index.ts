@@ -3,7 +3,7 @@ import { createNextShield, withNextShield, extractNextClientIp } from './next';
 import { resolveConfig, DEFAULT_CONFIG } from './config';
 import { RateLimiter } from './rate-limiter';
 import { Detector } from './detector';
-import { BlockManager, isValidIp, normalizeIp, parseDuration, type BlockInfo } from './block-manager';
+import { BlockManager, isValidIp, normalizeIp, canonicalizeIpv6, parseDuration, type BlockInfo } from './block-manager';
 import { Logger, stripAnsi, sanitizeString, sanitizeRoute, sanitizeMethod } from './logger';
 import type {
   ZShieldConfig,
@@ -103,6 +103,7 @@ export {
   BlockManager,
   isValidIp,
   normalizeIp,
+  canonicalizeIpv6,
   parseDuration,
   Logger,
   stripAnsi,

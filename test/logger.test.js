@@ -28,6 +28,18 @@ describe('Z-Shield Phase 4: Persistent Local JSONL Security Event Logging', () =
     test('strips ANSI terminal escape codes', () => {
       const injected = '\x1b[31;1mINJECTED_RED\x1b[0m normal';
       assert.equal(stripAnsi(injected), 'INJECTED_RED normal');
+
+      // OSC terminal window title escape sequence
+      const oscInjected = '\x1b]0;Evil Terminal Title\x07Clean Text';
+      assert.equal(stripAnsi(oscInjected), 'Clean Text');
+
+      // OSC hyperlink sequence
+      const linkInjected = '\x1b]8;;https://evil.example.com\x1b\\Click Here\x1b]8;;\x1b\\';
+      assert.equal(stripAnsi(linkInjected), 'Click Here');
+
+      // 2-character escape codes
+      const twoByte = '\x1b[2KCleared Line';
+      assert.equal(stripAnsi(twoByte), 'Cleared Line');
     });
 
     test('sanitizes strings against log injection (newlines, control characters)', () => {
@@ -258,6 +270,162 @@ describe('Z-Shield Phase 4: Persistent Local JSONL Security Event Logging', () =
       const result = await logger.log({ ip: '198.51.100.99' });
       assert.equal(result, false);
       assert.equal(callbackInvoked, true);
+    });
+
+    test('enforces bounded pending-write queue under simulated slow writes and drops events safely', async () => {
+      // Mock slow writes by intercepting fs.promises.appendFile
+      const originalAppendFile = fs.promises.appendFile;
+      let slowWritesActive = true;
+
+      fs.promises.appendFile = async function (...args) {
+        if (slowWritesActive) {
+          // Delay write by 40ms to simulate disk latency / IO bottleneck
+          await new Promise((resolve) => setTimeout(resolve, 40));
+        }
+        return originalAppendFile.apply(this, args);
+      };
+
+      try {
+        const droppedErrors = [];
+        const logger = new Logger({
+          logDir: tempDir,
+          maxQueueSize: 5,
+          onLogError: (err, event) => {
+            droppedErrors.push({ err, event });
+          }
+        });
+
+        assert.equal(logger.maxQueueSize, 5);
+        assert.equal(logger.pendingWrites, 0);
+        assert.equal(logger.droppedEvents, 0);
+
+        // Fire 20 writes in rapid succession while disk IO is slow
+        const promises = [];
+        for (let i = 0; i < 20; i++) {
+          promises.push(
+            logger.log({
+              ip: `10.0.0.${i}`,
+              reason: `Slow write event ${i}`
+            })
+          );
+        }
+
+        // Bounded queue must never exceed maxQueueSize (5)
+        assert.ok(logger.pendingWrites <= 5, `pendingWrites (${logger.pendingWrites}) exceeded maxQueueSize`);
+
+        // Wait for all 20 calls to resolve
+        const results = await Promise.all(promises);
+
+        // First 5 should succeed (true), remaining 15 dropped (false)
+        const successCount = results.filter((r) => r === true).length;
+        const droppedCount = results.filter((r) => r === false).length;
+
+        assert.equal(successCount, 5);
+        assert.equal(droppedCount, 15);
+        assert.equal(logger.droppedEvents, 15);
+        assert.equal(droppedErrors.length, 15);
+        assert.match(droppedErrors[0].err.message, /Write queue capacity of 5 reached/);
+
+        // Turn off artificial delay so flush completes quickly
+        slowWritesActive = false;
+        await logger.flush();
+
+        // After flush, pending writes must return to 0
+        assert.equal(logger.pendingWrites, 0);
+
+        // Log file should contain exactly the 5 accepted events in FIFO order
+        const logFile = path.join(tempDir, 'events.jsonl');
+        assert.equal(fs.existsSync(logFile), true);
+        const lines = fs.readFileSync(logFile, 'utf8').trim().split('\n');
+        assert.equal(lines.length, 5);
+
+        for (let i = 0; i < 5; i++) {
+          const entry = JSON.parse(lines[i]);
+          assert.equal(entry.ip, `10.0.0.${i}`);
+          assert.equal(entry.reason, `Slow write event ${i}`);
+        }
+
+        // Subsequent writes after queue drain succeed normally
+        const postOverloadResult = await logger.log({
+          ip: '10.0.0.99',
+          reason: 'Post-recovery event'
+        });
+        assert.equal(postOverloadResult, true);
+        assert.equal(logger.pendingWrites, 0);
+
+        const updatedLines = fs.readFileSync(logFile, 'utf8').trim().split('\n');
+        assert.equal(updatedLines.length, 6);
+      } finally {
+        fs.promises.appendFile = originalAppendFile;
+      }
+    });
+
+    test('queue overload gracefully handles throwing onLogError without crashing', async () => {
+      let slowWritesActive = true;
+      const originalAppendFile = fs.promises.appendFile;
+      fs.promises.appendFile = async function (...args) {
+        if (slowWritesActive) {
+          await new Promise((resolve) => setTimeout(resolve, 30));
+        }
+        return originalAppendFile.apply(this, args);
+      };
+
+      try {
+        let callbackCount = 0;
+        const logger = new Logger({
+          logDir: tempDir,
+          maxQueueSize: 2,
+          onLogError: () => {
+            callbackCount++;
+            throw new Error('Exploding error callback during drop!');
+          }
+        });
+
+        // Fill capacity (2 items)
+        const p1 = logger.log({ ip: '1.1.1.1' });
+        const p2 = logger.log({ ip: '1.1.1.2' });
+
+        // Exceed capacity: should trigger throwing callback safely
+        const p3 = logger.log({ ip: '1.1.1.3' });
+        const p3Result = await p3;
+
+        assert.equal(p3Result, false);
+        assert.equal(logger.droppedEvents, 1);
+        assert.equal(callbackCount, 1);
+
+        slowWritesActive = false;
+        await Promise.all([p1, p2]);
+        await logger.flush();
+      } finally {
+        fs.promises.appendFile = originalAppendFile;
+      }
+    });
+
+    test('recovers automatically if log directory is deleted externally while running', async () => {
+      const customSubdir = path.join(tempDir, 'runtime-logs');
+      const logger = new Logger({
+        logDir: customSubdir,
+        appName: 'recovery-app'
+      });
+
+      // 1. Initial write creates directory and writes event
+      const res1 = await logger.log({ ip: '10.0.0.1', reason: 'Initial event' });
+      await logger.flush();
+      assert.equal(res1, true);
+      assert.ok(fs.existsSync(logger.filePath));
+
+      // 2. Simulate external deletion of the log directory at runtime (e.g. logrotate or admin action)
+      fs.rmSync(customSubdir, { recursive: true, force: true });
+      assert.equal(fs.existsSync(customSubdir), false);
+
+      // 3. Subsequent write should detect ENOENT, reset _dirEnsured, recreate directory and succeed
+      const res2 = await logger.log({ ip: '10.0.0.2', reason: 'Post-deletion event' });
+      await logger.flush();
+      assert.equal(res2, true);
+      assert.ok(fs.existsSync(logger.filePath));
+
+      const content = fs.readFileSync(logger.filePath, 'utf8');
+      assert.ok(content.includes('Post-deletion event'));
     });
   });
 

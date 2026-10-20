@@ -8,6 +8,8 @@ export interface LoggerOptions {
   logFilename?: string;
   maxLogSizeBytes?: number;
   maxLogFiles?: number;
+  maxLogQueueSize?: number;
+  maxQueueSize?: number;
   onLogError?: ((err: Error, event: Record<string, unknown>) => void) | null;
 }
 
@@ -23,14 +25,21 @@ export interface FormattedSecurityEvent {
   action: string;
 }
 
+const ANSI_REGEX =
+  /[\u001B\u009B](?:\[[0-9;?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])/g;
+
 /**
  * Strips ANSI terminal escape codes from untrusted strings to prevent terminal injection.
+ * Removes CSI color/control sequences, OSC title/hyperlink sequences, and escape codes.
+ *
  * @param str - Untrusted string
  * @returns Clean string without ANSI escapes
  */
 export function stripAnsi(str: string): string {
-  // Matches standard ANSI color and control escape sequences
-  return str.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '');
+  if (typeof str !== 'string') {
+    return '';
+  }
+  return str.replace(ANSI_REGEX, '');
 }
 
 /**
@@ -66,16 +75,16 @@ export function sanitizeRoute(route: unknown, maxLength: number = 500): string {
   if (!route || typeof route !== 'string') {
     return '/';
   }
-  let clean = route.split(/[\r\n]/)[0];
+  let clean = route.split(/[\r\n]/)[0] ?? '';
   clean = stripAnsi(clean);
   // Strip query parameters and URL fragments to prevent credential leakage (CWE-532)
-  clean = clean.split('?')[0].split('#')[0];
+  clean = (clean.split('?')[0] ?? '').split('#')[0] ?? '';
   // Remove dangerous control characters and newlines
   clean = clean.replace(/[\x00-\x1f\x7f]/g, '').trim();
   if (!clean.startsWith('/')) {
     clean = '/' + clean;
   }
-  return clean.slice(0, maxLength);
+  return clean.slice(0, maxLength) || '/';
 }
 
 /**
@@ -100,6 +109,7 @@ export function sanitizeMethod(method: unknown): string {
  * - Strict Sanitization: Eliminates Log Injection (CWE-117) by stripping newlines and ANSI escapes.
  * - Privacy-Preserving: Never logs passwords, cookies, authorization headers, or request bodies (CWE-532).
  * - Bounded Storage: Automatic log rotation and retention limits prevent disk space exhaustion.
+ * - Bounded Queue: Strictly caps pending in-memory write operations to prevent memory exhaustion under attack.
  * - Resilient: Filesystem errors (ENOSPC, EACCES) are safely caught and will not crash the host app.
  * - Sequential Queue: Guarantees concurrency safety so simultaneous writes never corrupt files.
  *
@@ -115,10 +125,13 @@ export class Logger {
   readonly filePath: string;
   readonly maxLogSizeBytes: number;
   readonly maxLogFiles: number;
+  readonly maxQueueSize: number;
   readonly onLogError: ((err: Error, event: Record<string, unknown>) => void) | null;
 
   private _writeQueue: Promise<void>;
   private _dirEnsured: boolean;
+  private _pendingWrites: number;
+  private _droppedEvents: number;
 
   /**
    * @param config - Logger options or resolved Z-Shield configuration
@@ -130,10 +143,33 @@ export class Logger {
     this.filePath = path.join(this.logDir, this.logFilename);
     this.maxLogSizeBytes = config.maxLogSizeBytes || 5 * 1024 * 1024; // 5MB
     this.maxLogFiles = typeof config.maxLogFiles === 'number' ? config.maxLogFiles : 5;
+    const rawQueueLimit =
+      (config as Record<string, unknown>).maxLogQueueSize ??
+      (config as Record<string, unknown>).maxQueueSize;
+    this.maxQueueSize =
+      typeof rawQueueLimit === 'number' && Number.isInteger(rawQueueLimit) && rawQueueLimit > 0
+        ? rawQueueLimit
+        : 1000;
     this.onLogError = typeof config.onLogError === 'function' ? config.onLogError : null;
 
     this._writeQueue = Promise.resolve();
     this._dirEnsured = false;
+    this._pendingWrites = 0;
+    this._droppedEvents = 0;
+  }
+
+  /**
+   * Returns the count of currently queued or executing asynchronous write operations.
+   */
+  get pendingWrites(): number {
+    return this._pendingWrites;
+  }
+
+  /**
+   * Returns the cumulative count of log events dropped due to write queue overload.
+   */
+  get droppedEvents(): number {
+    return this._droppedEvents;
   }
 
   /**
@@ -173,17 +209,41 @@ export class Logger {
 
   /**
    * Safely logs a security event asynchronously.
-   * Resolves to true if write succeeded, or false if it failed.
+   * Resolves to true if write succeeded, or false if it failed or was dropped due to queue overload.
    *
    * @param rawEvent - Raw event data
    * @returns True if write succeeded, false otherwise
    */
   log(rawEvent: Record<string, unknown>): Promise<boolean> {
+    if (this._pendingWrites >= this.maxQueueSize) {
+      this._droppedEvents++;
+      if (this.onLogError) {
+        try {
+          this.onLogError(
+            new Error(`[Z-Shield Logger]: Write queue capacity of ${this.maxQueueSize} reached. Event dropped.`),
+            rawEvent
+          );
+        } catch {
+          // Prevent user callback exceptions from propagating or crashing
+        }
+      } else if (this._droppedEvents === 1 || this._droppedEvents % 1000 === 0) {
+        console.error(
+          `[Z-Shield Logger Warning]: Write queue capacity of ${this.maxQueueSize} reached. ${this._droppedEvents} event(s) dropped.`
+        );
+      }
+      return Promise.resolve(false);
+    }
+
+    this._pendingWrites++;
     return new Promise((resolve) => {
       this._writeQueue = this._writeQueue
         .then(() => this._writeEvent(rawEvent))
-        .then(() => resolve(true))
+        .then(() => {
+          this._pendingWrites--;
+          resolve(true);
+        })
         .catch((err: Error) => {
+          this._pendingWrites--;
           this._handleError(err, rawEvent);
           resolve(false);
         });
@@ -209,14 +269,27 @@ export class Logger {
     await this._rotateIfNeeded();
 
     const line = JSON.stringify(event) + '\n';
-    await fs.promises.appendFile(this.filePath, line, { encoding: 'utf8', flag: 'a' });
+    try {
+      await fs.promises.appendFile(this.filePath, line, { encoding: 'utf8', flag: 'a' });
+    } catch (err: unknown) {
+      // Self-healing recovery: if directory was removed externally right before write,
+      // recreate directory and retry appending once before throwing.
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+        this._dirEnsured = false;
+        await fs.promises.mkdir(this.logDir, { recursive: true });
+        this._dirEnsured = true;
+        await fs.promises.appendFile(this.filePath, line, { encoding: 'utf8', flag: 'a' });
+        return;
+      }
+      throw err;
+    }
   }
 
   /**
    * Ensures the target log directory exists.
    */
   private async _ensureDir(): Promise<void> {
-    if (!this._dirEnsured) {
+    if (!this._dirEnsured || !fs.existsSync(this.logDir)) {
       await fs.promises.mkdir(this.logDir, { recursive: true });
       this._dirEnsured = true;
     }
@@ -288,6 +361,10 @@ export class Logger {
    * @param rawEvent - Raw event data attempted to be written
    */
   private _handleError(err: Error, rawEvent: Record<string, unknown>): void {
+    // If the directory was deleted externally while running, reset _dirEnsured so the next
+    // write attempt will automatically recreate the directory instead of failing permanently.
+    this._dirEnsured = false;
+
     if (this.onLogError) {
       try {
         this.onLogError(err, rawEvent);

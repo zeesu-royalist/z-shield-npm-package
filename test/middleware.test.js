@@ -148,6 +148,13 @@ describe('Z-Shield Phase 1: Configuration & Middleware Foundation', () => {
       assert.equal(typeof withFunc.onLogError, 'function');
       const withNull = resolveConfig({ onLogError: null });
       assert.equal(withNull.onLogError, null);
+
+      // maxLogQueueSize
+      assert.throws(() => resolveConfig({ maxLogQueueSize: -5 }), /"maxLogQueueSize" must be a positive integer/);
+      assert.throws(() => resolveConfig({ maxLogQueueSize: 0 }), /"maxLogQueueSize" must be a positive integer/);
+      assert.throws(() => resolveConfig({ maxLogQueueSize: 10.5 }), /"maxLogQueueSize" must be a positive integer/);
+      const validQueue = resolveConfig({ maxLogQueueSize: 500 });
+      assert.equal(validQueue.maxLogQueueSize, 500);
     });
 
     test('ensures two instances do not share or mutate configuration state', () => {
@@ -212,7 +219,7 @@ describe('Z-Shield Phase 1: Configuration & Middleware Foundation', () => {
       assert.equal(extractClientIp(fakeMapped, false), '192.168.1.50');
 
       const fakeIpv6 = { socket: { remoteAddress: '2001:0DB8:85A3:0000:0000:8A2E:0370:7334' } };
-      assert.equal(extractClientIp(fakeIpv6, false), '2001:0db8:85a3:0000:0000:8a2e:0370:7334');
+      assert.equal(extractClientIp(fakeIpv6, false), '2001:db8:85a3::8a2e:370:7334');
     });
   });
 

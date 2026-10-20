@@ -1,6 +1,6 @@
 {
   "name": "z-shield",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "API abuse detection, rate limiting, and temporary IP blocking middleware for Node.js and Express",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -12,6 +12,14 @@
     "./next": {
       "types": "./dist/next.d.ts",
       "default": "./dist/next.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "typesVersions": {
+    "*": {
+      "next": [
+        "dist/next.d.ts"
+      ]
     }
   },
   "bin": {
@@ -19,8 +27,11 @@
   },
   "scripts": {
     "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "prepack": "npm run build",
     "pretest": "npm run build",
     "test": "node --test test/*.test.js",
+    "test:coverage": "node --test --experimental-test-coverage test/*.test.js",
     "start": "node examples/express-app.js"
   },
   "repository": {
@@ -43,6 +54,8 @@
   "license": "MIT",
   "files": [
     "dist",
+    "next.js",
+    "next.d.ts",
     "README.md",
     "LICENSE",
     "SECURITY.md"

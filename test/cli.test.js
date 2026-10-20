@@ -126,6 +126,33 @@ describe('Z-Shield Phase 5: CLI Commands & Architecture', () => {
       }
     });
 
+    test('strictly validates --log-file and rejects path traversal attempts', () => {
+      // Valid custom filenames
+      const valid1 = resolveLogPath({ 'log-file': 'custom.jsonl' });
+      assert.ok(valid1.endsWith(path.join('.z-shield-logs', 'custom.jsonl')));
+
+      const valid2 = resolveLogPath({ logFile: 'audit_2026.log' });
+      assert.ok(valid2.endsWith(path.join('.z-shield-logs', 'audit_2026.log')));
+
+      // Rejects path traversal
+      assert.throws(
+        () => resolveLogPath({ 'log-file': '../secret.json' }),
+        /--log-file.*must be a safe filename without path traversal characters/
+      );
+      assert.throws(
+        () => resolveLogPath({ 'log-file': 'sub/dir.jsonl' }),
+        /--log-file.*must be a safe filename without path traversal characters/
+      );
+      assert.throws(
+        () => resolveLogPath({ 'log-file': '..\\windows.jsonl' }),
+        /--log-file.*must be a safe filename without path traversal characters/
+      );
+      assert.throws(
+        () => resolveLogPath({ logFile: '/etc/passwd' }),
+        /--log-file.*must be a safe filename without path traversal characters/
+      );
+    });
+
     test('skips malformed JSON lines without crashing and reports count', () => {
       const logFile = path.join(tempDir, 'test-events.jsonl');
       const sample = [
@@ -252,7 +279,7 @@ describe('Z-Shield Phase 5: CLI Commands & Architecture', () => {
       assert.equal(sanitizeIp('192.168.1.1\r\nINJECTED'), '192.168.1.1');
       assert.equal(sanitizeIp('::1'), '127.0.0.1');
       assert.equal(sanitizeIp('::ffff:192.168.1.1'), '192.168.1.1');
-      assert.equal(sanitizeIp('2001:0db8:85a3:0000:0000:8a2e:0370:7334'), '2001:0db8:85a3:0000:0000:8a2e:0370:7334');
+      assert.equal(sanitizeIp('2001:0db8:85a3:0000:0000:8a2e:0370:7334'), '2001:db8:85a3::8a2e:370:7334');
       assert.equal(sanitizeIp('completely-invalid-ip'), 'unknown');
       assert.equal(sanitizeIp(''), 'unknown');
       assert.equal(sanitizeIp(null), 'unknown');

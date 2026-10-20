@@ -25,6 +25,7 @@ export interface ZShieldOptions {
   excludeRoutes?: string[] | readonly string[];
   maxLogSizeBytes?: number;
   maxLogFiles?: number;
+  maxLogQueueSize?: number;
   onLogError?: ((err: Error, event: Record<string, unknown>) => void) | null;
 }
 
@@ -44,6 +45,7 @@ export interface ZShieldConfig {
   readonly excludeRoutes: readonly string[];
   readonly maxLogSizeBytes: number;
   readonly maxLogFiles: number;
+  readonly maxLogQueueSize: number;
   readonly onLogError: ((err: Error, event: Record<string, unknown>) => void) | null;
 }
 

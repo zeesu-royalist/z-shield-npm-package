@@ -95,7 +95,7 @@ export function isRouteExcluded(requestPath: string, excludeRoutes: readonly str
   }
 
   // Strip query string and fragment if present (e.g. from req.url)
-  const cleanPath = (requestPath || '/').split('?')[0].split('#')[0];
+  const cleanPath = (requestPath || '/').split('?')[0]?.split('#')[0] ?? '/';
 
   return excludeRoutes.some((route) => {
     if (typeof route !== 'string' || route.length === 0) {
@@ -175,7 +175,7 @@ export function createMiddleware(
       const rawPath = (typeof req.path === 'string' && req.path.length > 0)
         ? req.path
         : (req.url || '/');
-      const requestPath = rawPath.split('?')[0].split('#')[0] || '/';
+      const requestPath = (rawPath.split('?')[0] ?? '').split('#')[0] || '/';
       const requestMethod = req.method || 'GET';
       const now = Date.now();
 

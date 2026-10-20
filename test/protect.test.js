@@ -5,7 +5,8 @@ const assert = require('node:assert/strict');
 const http = require('node:http');
 const express = require('express');
 
-const { BlockManager, isValidIp, parseDuration } = require('../dist/block-manager');
+const { BlockManager, isValidIp, normalizeIp, canonicalizeIpv6, parseDuration } = require('../dist/block-manager');
+const { RateLimiter } = require('../dist/rate-limiter');
 const { createShield, resolveConfig } = require('../dist/index');
 
 describe('Z-Shield Phase 3: Protection Mode & Temporary IP Blocking', () => {
@@ -113,6 +114,101 @@ describe('Z-Shield Phase 3: Protection Mode & Temporary IP Blocking', () => {
       bm.block('::FFFF:192.0.2.1', '10m');
       assert.equal(bm.isBlocked('192.0.2.1'), true);
       assert.equal(bm.isBlocked('::ffff:192.0.2.1'), true);
+    });
+
+    test('RFC 5952 IPv6 canonicalization handles compressed, expanded, leading zeros, and tie-breaking', () => {
+      // Compressed and expanded
+      assert.equal(canonicalizeIpv6('2001:db8::1'), '2001:db8::1');
+      assert.equal(canonicalizeIpv6('2001:0db8:0000:0000:0000:0000:0000:0001'), '2001:db8::1');
+      assert.equal(canonicalizeIpv6('2001:DB8:0:0:0:0:0:1'), '2001:db8::1');
+
+      // Leading zeros in hextets
+      assert.equal(canonicalizeIpv6('2001:0001:0002:0003:0004:0005:0006:0007'), '2001:1:2:3:4:5:6:7');
+
+      // RFC 5952 rule: single 16-bit 0 field must NOT be compressed
+      assert.equal(canonicalizeIpv6('2001:db8:0:1:1:1:1:1'), '2001:db8:0:1:1:1:1:1');
+
+      // RFC 5952 rule: longest zero run wins
+      assert.equal(canonicalizeIpv6('2001:db8:0:0:0:1:0:0'), '2001:db8::1:0:0');
+
+      // RFC 5952 rule: first zero run wins on equal length tie
+      assert.equal(canonicalizeIpv6('2001:db8:0:0:1:0:0:1'), '2001:db8::1:0:0:1');
+
+      // Unspecified address
+      assert.equal(canonicalizeIpv6('::'), '::');
+      assert.equal(canonicalizeIpv6('0:0:0:0:0:0:0:0'), '::');
+
+      // Zone identifier stripping
+      assert.equal(canonicalizeIpv6('fe80::1%eth0'), 'fe80::1');
+    });
+
+    test('normalizeIp handles IPv6 loopback variants, IPv4-mapped, valid IPv4, and invalid addresses', () => {
+      // Loopback variants all normalize to 127.0.0.1
+      assert.equal(normalizeIp('::1'), '127.0.0.1');
+      assert.equal(normalizeIp('0:0:0:0:0:0:0:1'), '127.0.0.1');
+      assert.equal(normalizeIp('0000:0000:0000:0000:0000:0000:0000:0001'), '127.0.0.1');
+
+      // IPv4-mapped IPv6 variants all unmap to clean IPv4
+      assert.equal(normalizeIp('::ffff:192.0.2.1'), '192.0.2.1');
+      assert.equal(normalizeIp('::FFFF:192.0.2.1'), '192.0.2.1');
+      assert.equal(normalizeIp('0:0:0:0:0:ffff:192.0.2.1'), '192.0.2.1');
+      assert.equal(normalizeIp('0000:0000:0000:0000:0000:ffff:192.0.2.1'), '192.0.2.1');
+
+      // IPv4 preserved
+      assert.equal(normalizeIp('198.51.100.1'), '198.51.100.1');
+
+      // Invalid IPs preserved safely without throwing or fabricating valid addresses
+      assert.equal(normalizeIp('not-an-ip'), 'not-an-ip');
+      assert.equal(normalizeIp('2001:db8:::1'), '2001:db8:::1');
+      assert.equal(normalizeIp('::g'), '::g');
+
+      // Empty / non-string falls back to 'unknown'
+      assert.equal(normalizeIp(''), 'unknown');
+      assert.equal(normalizeIp('   '), 'unknown');
+      assert.equal(normalizeIp(null), 'unknown');
+      assert.equal(normalizeIp(undefined), 'unknown');
+    });
+
+    test('regression test: equivalent IPv6 representations share the exact same rate-limit identity', () => {
+      const limiter = new RateLimiter({ maxRequests: 3, windowMs: 60000 });
+      const now = 100000;
+
+      // Send 2 requests from fully expanded IPv6
+      const r1 = limiter.record('2001:0db8:0000:0000:0000:0000:0000:0001', now);
+      assert.equal(r1.count, 1);
+      assert.equal(r1.isExceeded, false);
+
+      const r2 = limiter.record('2001:0db8:0000:0000:0000:0000:0000:0001', now);
+      assert.equal(r2.count, 2);
+      assert.equal(r2.isExceeded, false);
+
+      // Send 3rd request from compressed representation -> reaches limit
+      const r3 = limiter.record('2001:db8::1', now);
+      assert.equal(r3.count, 3);
+      assert.equal(r3.isExceeded, false);
+
+      // Send 4th request from uppercase mixed representation -> must be exceeded!
+      const r4 = limiter.record('2001:DB8:0:0:0:0:0:1', now);
+      assert.equal(r4.count, 4);
+      assert.equal(r4.isExceeded, true);
+    });
+
+    test('regression test: equivalent IPv6 representations share the exact same block identity', () => {
+      const bm = new BlockManager();
+
+      // Block expanded address
+      bm.block('2001:0db8:0000:0000:0000:0000:0000:0001', '10m', 'Rate limit block');
+
+      // Query compressed and uppercase representations
+      assert.equal(bm.isBlocked('2001:db8::1'), true);
+      assert.equal(bm.isBlocked('2001:DB8:0:0:0:0:0:1'), true);
+      assert.ok(bm.getBlockInfo('2001:db8::1') !== null);
+
+      // Unblock using compressed representation
+      assert.equal(bm.unblock('2001:db8::1'), true);
+
+      // Expanded representation is now also unblocked
+      assert.equal(bm.isBlocked('2001:0db8:0000:0000:0000:0000:0000:0001'), false);
     });
 
     test('rejects blocking an invalid IP address', () => {
