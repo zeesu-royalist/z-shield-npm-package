@@ -1,12 +1,12 @@
-'use strict';
-
-const path = require('node:path');
+import path from 'node:path';
+import { parseDuration } from './block-manager';
+import type { ZShieldConfig, ZShieldOptions } from './types';
 
 /**
  * Default configuration values for Z-Shield.
  * Designed with conservative, safe defaults.
  */
-const DEFAULT_CONFIG = {
+export const DEFAULT_CONFIG: ZShieldConfig = {
   // Unique identifier for the host application (useful when multiple apps share a server)
   appName: 'default-app',
 
@@ -59,107 +59,115 @@ const DEFAULT_CONFIG = {
  * Validates user-provided options and merges them with defaults.
  * Throws clear, helpful errors if an invalid option is passed.
  *
- * @param {Object} [userConfig={}] - Custom configuration provided by the developer
- * @returns {Readonly<Object>} Validated and frozen configuration object
+ * @param userConfig - Custom configuration provided by the developer
+ * @returns Validated and frozen configuration object
  */
-function resolveConfig(userConfig = {}) {
+export function resolveConfig(userConfig: ZShieldOptions | ZShieldConfig = {}): ZShieldConfig {
   if (userConfig === null || typeof userConfig !== 'object' || Array.isArray(userConfig)) {
     throw new TypeError('[Z-Shield] Configuration must be a plain object.');
   }
 
-  const config = { ...DEFAULT_CONFIG, ...userConfig };
+  const rawConfig = { ...DEFAULT_CONFIG, ...userConfig };
 
   // Validate appName
-  if (typeof config.appName !== 'string' || config.appName.trim().length === 0) {
+  if (typeof rawConfig.appName !== 'string' || rawConfig.appName.trim().length === 0) {
     throw new TypeError('[Z-Shield] "appName" must be a non-empty string.');
   }
   // Prevent directory traversal characters in appName (e.g., "../hacker")
-  if (!/^[a-zA-Z0-9_-]+$/.test(config.appName)) {
+  if (!/^[a-zA-Z0-9_-]+$/.test(rawConfig.appName)) {
     throw new Error('[Z-Shield] "appName" can only contain letters, numbers, dashes, and underscores.');
   }
 
   // Validate mode
-  if (config.mode !== 'monitor' && config.mode !== 'protect') {
-    throw new Error(`[Z-Shield] Invalid mode "${config.mode}". Mode must be either "monitor" or "protect".`);
+  if (rawConfig.mode !== 'monitor' && rawConfig.mode !== 'protect') {
+    throw new Error(`[Z-Shield] Invalid mode "${String(rawConfig.mode)}". Mode must be either "monitor" or "protect".`);
   }
 
   // Validate windowMs
-  if (typeof config.windowMs !== 'number' || !Number.isFinite(config.windowMs) || config.windowMs <= 0) {
+  if (typeof rawConfig.windowMs !== 'number' || !Number.isFinite(rawConfig.windowMs) || rawConfig.windowMs <= 0) {
     throw new TypeError('[Z-Shield] "windowMs" must be a positive number in milliseconds.');
   }
 
   // Validate maxRequests
-  if (typeof config.maxRequests !== 'number' || !Number.isInteger(config.maxRequests) || config.maxRequests <= 0) {
+  if (typeof rawConfig.maxRequests !== 'number' || !Number.isInteger(rawConfig.maxRequests) || rawConfig.maxRequests <= 0) {
     throw new TypeError('[Z-Shield] "maxRequests" must be a positive integer.');
   }
 
   // Validate logDir
-  if (typeof config.logDir !== 'string' || config.logDir.trim().length === 0) {
+  if (typeof rawConfig.logDir !== 'string' || rawConfig.logDir.trim().length === 0) {
     throw new TypeError('[Z-Shield] "logDir" must be a non-empty string path.');
   }
 
   // Validate trustProxy
-  if (typeof config.trustProxy !== 'boolean') {
+  if (typeof rawConfig.trustProxy !== 'boolean') {
     throw new TypeError('[Z-Shield] "trustProxy" must be a boolean (true or false).');
   }
 
   // Validate excludeRoutes
-  if (!Array.isArray(config.excludeRoutes) || !config.excludeRoutes.every(r => typeof r === 'string')) {
-    throw new TypeError('[Z-Shield] "excludeRoutes" must be an array of string route prefixes.');
+  if (
+    !Array.isArray(rawConfig.excludeRoutes) ||
+    !rawConfig.excludeRoutes.every(r => typeof r === 'string' && r.trim().length > 0)
+  ) {
+    throw new TypeError('[Z-Shield] "excludeRoutes" must be an array of non-empty string route prefixes.');
   }
 
   // Validate maxTrackedIps
-  if (typeof config.maxTrackedIps !== 'number' || !Number.isInteger(config.maxTrackedIps) || config.maxTrackedIps <= 0) {
+  if (typeof rawConfig.maxTrackedIps !== 'number' || !Number.isInteger(rawConfig.maxTrackedIps) || rawConfig.maxTrackedIps <= 0) {
     throw new TypeError('[Z-Shield] "maxTrackedIps" must be a positive integer.');
   }
 
+  // Support and validate blockDuration if provided
+  if (userConfig.blockDuration !== undefined) {
+    rawConfig.blockDurationMs = parseDuration(userConfig.blockDuration);
+  }
+
   // Validate blockDurationMs
-  if (typeof config.blockDurationMs !== 'number' || !Number.isFinite(config.blockDurationMs) || config.blockDurationMs <= 0) {
+  if (typeof rawConfig.blockDurationMs !== 'number' || !Number.isFinite(rawConfig.blockDurationMs) || rawConfig.blockDurationMs <= 0) {
     throw new TypeError('[Z-Shield] "blockDurationMs" must be a positive number in milliseconds.');
   }
 
   // Validate maxBlockedIps
-  if (typeof config.maxBlockedIps !== 'number' || !Number.isInteger(config.maxBlockedIps) || config.maxBlockedIps <= 0) {
+  if (typeof rawConfig.maxBlockedIps !== 'number' || !Number.isInteger(rawConfig.maxBlockedIps) || rawConfig.maxBlockedIps <= 0) {
     throw new TypeError('[Z-Shield] "maxBlockedIps" must be a positive integer.');
   }
 
   // Validate autoBlock
-  if (typeof config.autoBlock !== 'boolean') {
+  if (typeof rawConfig.autoBlock !== 'boolean') {
     throw new TypeError('[Z-Shield] "autoBlock" must be a boolean (true or false).');
   }
 
   // Validate logFilename
-  if (typeof config.logFilename !== 'string' || config.logFilename.trim().length === 0) {
+  if (typeof rawConfig.logFilename !== 'string' || rawConfig.logFilename.trim().length === 0) {
     throw new TypeError('[Z-Shield] "logFilename" must be a non-empty string.');
   }
-  if (!/^[a-zA-Z0-9._-]+$/.test(config.logFilename) || config.logFilename.includes('..')) {
+  if (
+    !/^[a-zA-Z0-9._-]+$/.test(rawConfig.logFilename) ||
+    rawConfig.logFilename.includes('..') ||
+    rawConfig.logFilename.includes('/') ||
+    rawConfig.logFilename.includes('\\')
+  ) {
     throw new Error('[Z-Shield] "logFilename" must be a safe filename without path traversal characters.');
   }
 
   // Validate maxLogSizeBytes
-  if (typeof config.maxLogSizeBytes !== 'number' || !Number.isInteger(config.maxLogSizeBytes) || config.maxLogSizeBytes <= 0) {
+  if (typeof rawConfig.maxLogSizeBytes !== 'number' || !Number.isInteger(rawConfig.maxLogSizeBytes) || rawConfig.maxLogSizeBytes <= 0) {
     throw new TypeError('[Z-Shield] "maxLogSizeBytes" must be a positive integer.');
   }
 
   // Validate maxLogFiles
-  if (typeof config.maxLogFiles !== 'number' || !Number.isInteger(config.maxLogFiles) || config.maxLogFiles < 0) {
+  if (typeof rawConfig.maxLogFiles !== 'number' || !Number.isInteger(rawConfig.maxLogFiles) || rawConfig.maxLogFiles < 0) {
     throw new TypeError('[Z-Shield] "maxLogFiles" must be a non-negative integer.');
   }
 
   // Validate onLogError
-  if (config.onLogError !== null && typeof config.onLogError !== 'function') {
+  if (rawConfig.onLogError !== null && typeof rawConfig.onLogError !== 'function') {
     throw new TypeError('[Z-Shield] "onLogError" must be null or a function.');
   }
 
   // Freeze the object so application code cannot accidentally mutate it at runtime
   return Object.freeze({
-    ...config,
-    logDir: path.resolve(config.logDir),
-    excludeRoutes: Object.freeze([...config.excludeRoutes])
-  });
+    ...rawConfig,
+    logDir: path.resolve(rawConfig.logDir),
+    excludeRoutes: Object.freeze([...rawConfig.excludeRoutes])
+  }) as ZShieldConfig;
 }
-
-module.exports = {
-  DEFAULT_CONFIG,
-  resolveConfig
-};

@@ -19,8 +19,8 @@ const {
   sanitizeIp,
   sanitizeType,
   sanitizeAction
-} = require('../src/cli');
-const { stripAnsi } = require('../src/logger');
+} = require('../dist/cli');
+const { stripAnsi } = require('../dist/logger');
 
 describe('Z-Shield Phase 5: CLI Commands & Architecture', () => {
   let tempDir;
@@ -99,6 +99,31 @@ describe('Z-Shield Phase 5: CLI Commands & Architecture', () => {
       const relativeLog = resolveLogPath({ 'log-dir': './custom-logs' });
       assert.equal(relativeLog, path.join(path.resolve('./custom-logs'), 'events.jsonl'));
       assert.ok(path.isAbsolute(relativeLog));
+    });
+
+    test('supports Z_SHIELD_LOG_DIR environment variable with proper precedence', () => {
+      const originalEnv = process.env.Z_SHIELD_LOG_DIR;
+      try {
+        // 1. Z_SHIELD_LOG_DIR env var used when no CLI option given
+        process.env.Z_SHIELD_LOG_DIR = '/var/log/z-shield';
+        const envLog = resolveLogPath();
+        assert.equal(envLog, path.join(path.resolve('/var/log/z-shield'), 'events.jsonl'));
+
+        // 2. CLI option --log-dir takes precedence over Z_SHIELD_LOG_DIR
+        const cliLog = resolveLogPath({ 'log-dir': './cli-override' });
+        assert.equal(cliLog, path.join(path.resolve('./cli-override'), 'events.jsonl'));
+
+        // 3. Empty or whitespace Z_SHIELD_LOG_DIR falls back to default
+        process.env.Z_SHIELD_LOG_DIR = '   ';
+        const fallbackLog = resolveLogPath();
+        assert.equal(fallbackLog, path.join(process.cwd(), '.z-shield-logs', 'events.jsonl'));
+      } finally {
+        if (originalEnv !== undefined) {
+          process.env.Z_SHIELD_LOG_DIR = originalEnv;
+        } else {
+          delete process.env.Z_SHIELD_LOG_DIR;
+        }
+      }
     });
 
     test('skips malformed JSON lines without crashing and reports count', () => {
@@ -268,7 +293,32 @@ describe('Z-Shield Phase 5: CLI Commands & Architecture', () => {
       const mock = createMockOutput();
       const code = await runCommand(['status', '--log-dir', tempDir], mock);
       assert.equal(code, 0);
-      assert.ok(mock.getStdout().includes('No log file found yet'));
+      const out = mock.getStdout();
+      assert.ok(out.includes('No log file found yet'));
+      assert.ok(out.includes('Checked Location:'));
+      assert.ok(out.includes(tempDir));
+      assert.ok(out.includes('Z_SHIELD_LOG_DIR'));
+      assert.ok(out.includes('--log-dir'));
+    });
+
+    test('logs command with missing file prints helpful message with path and hints', async () => {
+      const mock = createMockOutput();
+      const code = await runCommand(['logs', '--log-dir', tempDir], mock);
+      assert.equal(code, 0);
+      const out = mock.getStdout();
+      assert.ok(out.includes('No log file found at:'));
+      assert.ok(out.includes(tempDir));
+      assert.ok(out.includes('Z_SHIELD_LOG_DIR'));
+      assert.ok(out.includes('--log-dir'));
+    });
+
+    test('help command documents Z_SHIELD_LOG_DIR environment variable', async () => {
+      const mock = createMockOutput();
+      const code = await runCommand(['--help'], mock);
+      assert.equal(code, 0);
+      const out = mock.getStdout();
+      assert.ok(out.includes('Z_SHIELD_LOG_DIR'));
+      assert.ok(out.includes('--log-dir'));
     });
 
     test('logs command rejects invalid --limit', async () => {
@@ -566,7 +616,7 @@ describe('Z-Shield Phase 5: CLI Commands & Architecture', () => {
 
   describe('Child Process Binary Invocation', () => {
     test('executes CLI binary directly using node', () => {
-      const cliPath = path.resolve(__dirname, '../src/cli.js');
+      const cliPath = path.resolve(__dirname, '../dist/cli.js');
       const output = execFileSync(process.execPath, [cliPath, '--help'], { encoding: 'utf8' });
       assert.ok(output.includes('Z-Shield CLI'));
       assert.ok(output.includes('npx z-shield status'));

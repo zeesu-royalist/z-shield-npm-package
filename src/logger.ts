@@ -1,14 +1,34 @@
-'use strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import type { ZShieldConfig, ZShieldOptions } from './types';
 
-const fs = require('node:fs');
-const path = require('node:path');
+export interface LoggerOptions {
+  appName?: string;
+  logDir?: string;
+  logFilename?: string;
+  maxLogSizeBytes?: number;
+  maxLogFiles?: number;
+  onLogError?: ((err: Error, event: Record<string, unknown>) => void) | null;
+}
+
+export interface FormattedSecurityEvent {
+  timestamp: string;
+  appName: string;
+  type: string;
+  severity: string;
+  ip: string;
+  method: string;
+  route: string;
+  reason: string;
+  action: string;
+}
 
 /**
  * Strips ANSI terminal escape codes from untrusted strings to prevent terminal injection.
- * @param {string} str
- * @returns {string}
+ * @param str - Untrusted string
+ * @returns Clean string without ANSI escapes
  */
-function stripAnsi(str) {
+export function stripAnsi(str: string): string {
   // Matches standard ANSI color and control escape sequences
   return str.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '');
 }
@@ -19,11 +39,11 @@ function stripAnsi(str) {
  * - Strips control characters (newlines \r, \n, null bytes, backspaces, tabs)
  * - Truncates to maxLength to prevent disk space exhaustion
  *
- * @param {*} val
- * @param {number} [maxLength=250]
- * @returns {string}
+ * @param val - Untrusted candidate value
+ * @param maxLength - Maximum permitted length
+ * @returns Sanitized string
  */
-function sanitizeString(val, maxLength = 250) {
+export function sanitizeString(val: unknown, maxLength: number = 250): string {
   if (val === null || val === undefined) {
     return '';
   }
@@ -38,11 +58,11 @@ function sanitizeString(val, maxLength = 250) {
 
 /**
  * Sanitizes HTTP route paths.
- * @param {*} route
- * @param {number} [maxLength=500]
- * @returns {string}
+ * @param route - Untrusted route string
+ * @param maxLength - Maximum permitted length
+ * @returns Sanitized route
  */
-function sanitizeRoute(route, maxLength = 500) {
+export function sanitizeRoute(route: unknown, maxLength: number = 500): string {
   if (!route || typeof route !== 'string') {
     return '/';
   }
@@ -60,10 +80,10 @@ function sanitizeRoute(route, maxLength = 500) {
 
 /**
  * Sanitizes HTTP methods.
- * @param {*} method
- * @returns {string}
+ * @param method - Untrusted method string
+ * @returns Sanitized uppercase HTTP method
  */
-function sanitizeMethod(method) {
+export function sanitizeMethod(method: unknown): string {
   if (!method || typeof method !== 'string') {
     return 'GET';
   }
@@ -88,11 +108,22 @@ function sanitizeMethod(method) {
  * (e.g. basic Heroku dynos, AWS Lambda, or serverless containers without mounted volumes),
  * local log files may be lost upon container restart or redeployment.
  */
-class Logger {
+export class Logger {
+  readonly appName: string;
+  readonly logDir: string;
+  readonly logFilename: string;
+  readonly filePath: string;
+  readonly maxLogSizeBytes: number;
+  readonly maxLogFiles: number;
+  readonly onLogError: ((err: Error, event: Record<string, unknown>) => void) | null;
+
+  private _writeQueue: Promise<void>;
+  private _dirEnsured: boolean;
+
   /**
-   * @param {Object} [config={}] - Resolved Z-Shield configuration
+   * @param config - Logger options or resolved Z-Shield configuration
    */
-  constructor(config = {}) {
+  constructor(config: LoggerOptions | ZShieldConfig | ZShieldOptions = {}) {
     this.appName = config.appName || 'default-app';
     this.logDir = path.resolve(config.logDir || path.join(process.cwd(), '.z-shield-logs'));
     this.logFilename = config.logFilename || 'events.jsonl';
@@ -109,18 +140,23 @@ class Logger {
    * Formats and sanitizes a security event into a validated schema.
    * Deliberately omits request bodies, authorization headers, cookies, and tokens.
    *
-   * @param {Object} rawEvent
-   * @returns {Object} Validated security event
+   * @param rawEvent - Raw event object
+   * @returns Validated security event
    */
-  formatEvent(rawEvent = {}) {
-    const now = rawEvent.timestamp ? new Date(rawEvent.timestamp) : new Date();
+  formatEvent(rawEvent: Record<string, unknown> = {}): FormattedSecurityEvent {
+    const rawTimestamp = rawEvent.timestamp;
+    const now = typeof rawTimestamp === 'string' || typeof rawTimestamp === 'number'
+      ? new Date(rawTimestamp)
+      : new Date();
     const timestamp = isNaN(now.getTime()) ? new Date().toISOString() : now.toISOString();
 
     const allowedSeverities = ['info', 'warning', 'critical'];
-    const severity = allowedSeverities.includes(rawEvent.severity) ? rawEvent.severity : 'warning';
+    const rawSeverity = typeof rawEvent.severity === 'string' ? rawEvent.severity : '';
+    const severity = allowedSeverities.includes(rawSeverity) ? rawSeverity : 'warning';
 
     const allowedActions = ['blocked', 'warned', 'allowed', 'unblocked'];
-    const action = allowedActions.includes(rawEvent.action) ? rawEvent.action : 'warned';
+    const rawAction = typeof rawEvent.action === 'string' ? rawEvent.action : '';
+    const action = allowedActions.includes(rawAction) ? rawAction : 'warned';
 
     return {
       timestamp,
@@ -139,15 +175,15 @@ class Logger {
    * Safely logs a security event asynchronously.
    * Resolves to true if write succeeded, or false if it failed.
    *
-   * @param {Object} rawEvent
-   * @returns {Promise<boolean>}
+   * @param rawEvent - Raw event data
+   * @returns True if write succeeded, false otherwise
    */
-  log(rawEvent) {
+  log(rawEvent: Record<string, unknown>): Promise<boolean> {
     return new Promise((resolve) => {
       this._writeQueue = this._writeQueue
         .then(() => this._writeEvent(rawEvent))
         .then(() => resolve(true))
-        .catch((err) => {
+        .catch((err: Error) => {
           this._handleError(err, rawEvent);
           resolve(false);
         });
@@ -157,20 +193,17 @@ class Logger {
   /**
    * Waits for all currently queued asynchronous log writes to complete.
    * Useful for deterministic testing, graceful shutdowns, and process exit handlers.
-   *
-   * @returns {Promise<void>}
    */
-  async flush() {
+  async flush(): Promise<void> {
     await this._writeQueue;
   }
 
   /**
    * Internal write operation executed within the sequential queue.
    *
-   * @private
-   * @param {Object} rawEvent
+   * @param rawEvent - Raw event to serialize and write
    */
-  async _writeEvent(rawEvent) {
+  private async _writeEvent(rawEvent: Record<string, unknown>): Promise<void> {
     const event = this.formatEvent(rawEvent);
     await this._ensureDir();
     await this._rotateIfNeeded();
@@ -181,9 +214,8 @@ class Logger {
 
   /**
    * Ensures the target log directory exists.
-   * @private
    */
-  async _ensureDir() {
+  private async _ensureDir(): Promise<void> {
     if (!this._dirEnsured) {
       await fs.promises.mkdir(this.logDir, { recursive: true });
       this._dirEnsured = true;
@@ -192,16 +224,15 @@ class Logger {
 
   /**
    * Checks file size and rotates log files if size exceeds maxLogSizeBytes.
-   * @private
    */
-  async _rotateIfNeeded() {
+  private async _rotateIfNeeded(): Promise<void> {
     try {
       const stats = await fs.promises.stat(this.filePath);
       if (stats.size < this.maxLogSizeBytes) {
         return;
       }
-    } catch (err) {
-      if (err.code === 'ENOENT') {
+    } catch (err: unknown) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
         return; // File does not exist yet
       }
       throw err;
@@ -213,8 +244,8 @@ class Logger {
     if (this.maxLogFiles === 0) {
       try {
         await fs.promises.unlink(this.filePath);
-      } catch (err) {
-        if (err.code !== 'ENOENT') throw err;
+      } catch (err: unknown) {
+        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
       }
       return;
     }
@@ -228,15 +259,15 @@ class Logger {
       if (i === this.maxLogFiles) {
         try {
           await fs.promises.unlink(currentRotated);
-        } catch (err) {
-          if (err.code !== 'ENOENT') throw err;
+        } catch (err: unknown) {
+          if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
         }
       } else {
         const nextRotated = path.join(this.logDir, `${name}.${i + 1}${ext}`);
         try {
           await fs.promises.rename(currentRotated, nextRotated);
-        } catch (err) {
-          if (err.code !== 'ENOENT') throw err;
+        } catch (err: unknown) {
+          if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
         }
       }
     }
@@ -245,19 +276,18 @@ class Logger {
     const firstRotated = path.join(this.logDir, `${name}.1${ext}`);
     try {
       await fs.promises.rename(this.filePath, firstRotated);
-    } catch (err) {
-      if (err.code !== 'ENOENT') throw err;
+    } catch (err: unknown) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
     }
   }
 
   /**
    * Safely handles write and filesystem failures without crashing the application.
    *
-   * @private
-   * @param {Error} err
-   * @param {Object} rawEvent
+   * @param err - Encountered error
+   * @param rawEvent - Raw event data attempted to be written
    */
-  _handleError(err, rawEvent) {
+  private _handleError(err: Error, rawEvent: Record<string, unknown>): void {
     if (this.onLogError) {
       try {
         this.onLogError(err, rawEvent);
@@ -270,11 +300,3 @@ class Logger {
     }
   }
 }
-
-module.exports = {
-  Logger,
-  sanitizeString,
-  sanitizeRoute,
-  sanitizeMethod,
-  stripAnsi
-};

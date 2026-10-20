@@ -6,8 +6,8 @@ const http = require('node:http');
 const path = require('node:path');
 const express = require('express');
 
-const { createShield, createMiddleware, resolveConfig, DEFAULT_CONFIG } = require('../src/index');
-const { extractClientIp } = require('../src/middleware');
+const { createShield, createMiddleware, resolveConfig, DEFAULT_CONFIG } = require('../dist/index');
+const { extractClientIp } = require('../dist/middleware');
 
 describe('Z-Shield Phase 1: Configuration & Middleware Foundation', () => {
 
@@ -81,6 +81,73 @@ describe('Z-Shield Phase 1: Configuration & Middleware Foundation', () => {
 
       assert.throws(() => resolveConfig({ logDir: '' }), /"logDir" must be a non-empty string path/);
       assert.throws(() => resolveConfig({ logDir: 123 }), /"logDir" must be a non-empty string path/);
+    });
+
+    test('validates and parses blockDuration strings and numbers', () => {
+      const cfg1 = resolveConfig({ blockDuration: '10m' });
+      assert.equal(cfg1.blockDurationMs, 600000);
+
+      const cfg2 = resolveConfig({ blockDuration: '30s' });
+      assert.equal(cfg2.blockDurationMs, 30000);
+
+      const cfg3 = resolveConfig({ blockDuration: '1h' });
+      assert.equal(cfg3.blockDurationMs, 3600000);
+
+      const cfg4 = resolveConfig({ blockDuration: 5000 });
+      assert.equal(cfg4.blockDurationMs, 5000);
+
+      assert.throws(() => resolveConfig({ blockDuration: '0s' }), /Block duration must be greater than zero/);
+      assert.throws(() => resolveConfig({ blockDuration: 0 }), /Block duration must be a positive number/);
+      assert.throws(() => resolveConfig({ blockDuration: -100 }), /Block duration must be a positive number/);
+      assert.throws(() => resolveConfig({ blockDuration: 'invalid' }), /Invalid duration format/);
+      assert.throws(() => resolveConfig({ blockDuration: {} }), /Block duration must be a number/);
+    });
+
+    test('validates excludeRoutes strictly and rejects invalid elements', () => {
+      assert.throws(() => resolveConfig({ excludeRoutes: '/health' }), /"excludeRoutes" must be an array/);
+      assert.throws(() => resolveConfig({ excludeRoutes: ['/health', 123] }), /"excludeRoutes" must be an array/);
+      assert.throws(() => resolveConfig({ excludeRoutes: ['/health', ''] }), /"excludeRoutes" must be an array of non-empty string/);
+      assert.throws(() => resolveConfig({ excludeRoutes: ['/health', '   '] }), /"excludeRoutes" must be an array of non-empty string/);
+      assert.throws(() => resolveConfig({ excludeRoutes: null }), /"excludeRoutes" must be an array/);
+    });
+
+    test('validates logFilename and prevents directory traversal', () => {
+      const valid = resolveConfig({ logFilename: 'custom.jsonl' });
+      assert.equal(valid.logFilename, 'custom.jsonl');
+
+      assert.throws(() => resolveConfig({ logFilename: '' }), /"logFilename" must be a non-empty string/);
+      assert.throws(() => resolveConfig({ logFilename: '../events.jsonl' }), /safe filename without path traversal/);
+      assert.throws(() => resolveConfig({ logFilename: 'dir/events.jsonl' }), /safe filename without path traversal/);
+      assert.throws(() => resolveConfig({ logFilename: 'dir\\events.jsonl' }), /safe filename without path traversal/);
+      assert.throws(() => resolveConfig({ logFilename: 123 }), /"logFilename" must be a non-empty string/);
+    });
+
+    test('validates maxBlockedIps, maxLogSizeBytes, maxLogFiles, and onLogError boundary cases', () => {
+      // maxBlockedIps
+      assert.throws(() => resolveConfig({ maxBlockedIps: 0 }), /"maxBlockedIps" must be a positive integer/);
+      assert.throws(() => resolveConfig({ maxBlockedIps: -5 }), /"maxBlockedIps" must be a positive integer/);
+      assert.throws(() => resolveConfig({ maxBlockedIps: 1.5 }), /"maxBlockedIps" must be a positive integer/);
+
+      // maxLogSizeBytes
+      assert.throws(() => resolveConfig({ maxLogSizeBytes: 0 }), /"maxLogSizeBytes" must be a positive integer/);
+      assert.throws(() => resolveConfig({ maxLogSizeBytes: -100 }), /"maxLogSizeBytes" must be a positive integer/);
+      assert.throws(() => resolveConfig({ maxLogSizeBytes: 1.5 }), /"maxLogSizeBytes" must be a positive integer/);
+
+      // maxLogFiles
+      assert.throws(() => resolveConfig({ maxLogFiles: -1 }), /"maxLogFiles" must be a non-negative integer/);
+      assert.throws(() => resolveConfig({ maxLogFiles: 1.5 }), /"maxLogFiles" must be a non-negative integer/);
+      const zeroFiles = resolveConfig({ maxLogFiles: 0 });
+      assert.equal(zeroFiles.maxLogFiles, 0);
+
+      // autoBlock
+      assert.throws(() => resolveConfig({ autoBlock: 'yes' }), /"autoBlock" must be a boolean/);
+
+      // onLogError
+      assert.throws(() => resolveConfig({ onLogError: 'not-a-func' }), /"onLogError" must be null or a function/);
+      const withFunc = resolveConfig({ onLogError: () => {} });
+      assert.equal(typeof withFunc.onLogError, 'function');
+      const withNull = resolveConfig({ onLogError: null });
+      assert.equal(withNull.onLogError, null);
     });
 
     test('ensures two instances do not share or mutate configuration state', () => {

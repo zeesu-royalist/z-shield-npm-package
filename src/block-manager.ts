@@ -1,6 +1,24 @@
-'use strict';
+import net from 'node:net';
+import type { BlockRecord, ZShieldConfig, ZShieldOptions } from './types';
 
-const net = require('node:net');
+export interface BlockManagerOptions {
+  blockDurationMs?: number;
+  maxBlockedIps?: number;
+}
+
+export interface BlockInfo {
+  ip: string;
+  blockedAt: number;
+  expiresAt: number;
+  remainingMs: number;
+  reason: string;
+}
+
+interface InternalBlockEntry {
+  blockedAt: number;
+  expiresAt: number;
+  reason: string;
+}
 
 /**
  * Normalizes an IP address for consistent comparison across IPv4 and IPv6.
@@ -10,10 +28,10 @@ const net = require('node:net');
  * - Converts IPv6 hex characters to lowercase to prevent case-sensitive map misses
  * - Preserves invalid strings without converting them into fake valid IPs
  *
- * @param {*} ip
- * @returns {string} Normalized IP or 'unknown'
+ * @param ip - Raw client IP candidate
+ * @returns Normalized IP or 'unknown'
  */
-function normalizeIp(ip) {
+export function normalizeIp(ip: unknown): string {
   if (typeof ip !== 'string') {
     return 'unknown';
   }
@@ -53,10 +71,10 @@ function normalizeIp(ip) {
  * Validates whether an IP address is a valid IPv4 or IPv6 string.
  * Uses Node.js built-in net.isIP (returns 4 for IPv4, 6 for IPv6, 0 for invalid).
  *
- * @param {string} ip
- * @returns {boolean}
+ * @param ip - IP candidate string
+ * @returns True if valid IPv4 or IPv6
  */
-function isValidIp(ip) {
+export function isValidIp(ip: unknown): boolean {
   if (typeof ip !== 'string' || ip.trim().length === 0) {
     return false;
   }
@@ -68,10 +86,10 @@ function isValidIp(ip) {
  * Parses block duration into milliseconds.
  * Supports numbers (milliseconds) or human-readable strings ('30s', '10m', '1h', '2d').
  *
- * @param {number|string} duration
- * @returns {number} duration in milliseconds
+ * @param duration - Numeric ms or formatted string
+ * @returns Duration in milliseconds
  */
-function parseDuration(duration) {
+export function parseDuration(duration: number | string): number {
   if (typeof duration === 'number') {
     const ms = Math.floor(duration);
     if (!Number.isFinite(duration) || duration <= 0 || ms <= 0) {
@@ -91,7 +109,7 @@ function parseDuration(duration) {
       throw new Error('[Z-Shield] Block duration must be greater than zero.');
     }
     const unit = (match[2] || 'ms').toLowerCase();
-    let ms;
+    let ms: number;
     switch (unit) {
       case 'ms': ms = Math.floor(val); break;
       case 's': ms = Math.floor(val * 1000); break;
@@ -118,30 +136,36 @@ function parseDuration(duration) {
  * - Bounded Memory: Uses LRU eviction when `maxBlockedIps` is reached to prevent memory exhaustion.
  * - No Background Timers: Uses passive/lazy expiration on access to keep Node.js event loop idle.
  */
-class BlockManager {
+export class BlockManager {
+  readonly defaultDurationMs: number;
+  readonly maxBlockedIps: number;
+  private readonly blocks: Map<string, InternalBlockEntry>;
+
   /**
-   * @param {Object} [options={}]
-   * @param {number} [options.blockDurationMs=900000] - Default block duration in ms (15 min)
-   * @param {number} [options.maxBlockedIps=5000] - Max blocked IPs in memory
+   * @param options - Block manager options or resolved config
    */
-  constructor(options = {}) {
+  constructor(options: BlockManagerOptions | ZShieldConfig | ZShieldOptions = {}) {
     this.defaultDurationMs = options.blockDurationMs || 15 * 60 * 1000;
     this.maxBlockedIps = options.maxBlockedIps || 5000;
 
-    /** @type {Map<string, { blockedAt: number, expiresAt: number, reason: string }>} */
-    this.blocks = new Map();
+    this.blocks = new Map<string, InternalBlockEntry>();
   }
 
   /**
    * Temporarily blocks an IP address.
    *
-   * @param {string} ip - Valid IPv4 or IPv6 address
-   * @param {number|string} [duration=this.defaultDurationMs] - Duration in ms or string ('10m')
-   * @param {string} [reason='Administrative block'] - Reason for block
-   * @param {number} [now=Date.now()] - Current timestamp (injectable for testing)
-   * @returns {{ ip: string, blockedAt: number, expiresAt: number, durationMs: number, reason: string }}
+   * @param ip - Valid IPv4 or IPv6 address
+   * @param duration - Duration in ms or string ('10m')
+   * @param reason - Reason for block
+   * @param now - Current timestamp (injectable for testing)
+   * @returns Created block record
    */
-  block(ip, duration = this.defaultDurationMs, reason = 'Administrative block', now = Date.now()) {
+  block(
+    ip: string,
+    duration: number | string = this.defaultDurationMs,
+    reason: string = 'Administrative block',
+    now: number = Date.now()
+  ): BlockRecord {
     if (!isValidIp(ip)) {
       throw new TypeError(`[Z-Shield] Cannot block invalid IP address: "${ip}".`);
     }
@@ -154,7 +178,7 @@ class BlockManager {
       this._evictOldest(now);
     }
 
-    const entry = {
+    const entry: InternalBlockEntry = {
       blockedAt: now,
       expiresAt: now + durationMs,
       reason: String(reason || 'Administrative block')
@@ -176,10 +200,10 @@ class BlockManager {
   /**
    * Manually unblocks an IP address.
    *
-   * @param {string} ip - Client IP
-   * @returns {boolean} True if IP was unblocked, false if it was not blocked
+   * @param ip - Client IP
+   * @returns True if IP was unblocked, false if it was not blocked
    */
-  unblock(ip) {
+  unblock(ip: string): boolean {
     if (!isValidIp(ip)) {
       throw new TypeError(`[Z-Shield] Cannot unblock invalid IP address: "${ip}".`);
     }
@@ -190,11 +214,11 @@ class BlockManager {
    * Checks whether an IP address is currently blocked.
    * Expired blocks are lazily pruned.
    *
-   * @param {string} ip
-   * @param {number} [now=Date.now()]
-   * @returns {boolean}
+   * @param ip - Client IP
+   * @param now - Current timestamp
+   * @returns True if actively blocked
    */
-  isBlocked(ip, now = Date.now()) {
+  isBlocked(ip: string | undefined | null, now: number = Date.now()): boolean {
     if (!ip || typeof ip !== 'string') {
       return false;
     }
@@ -218,17 +242,20 @@ class BlockManager {
   /**
    * Retrieves active block details for an IP, or null if not blocked/expired.
    *
-   * @param {string} ip
-   * @param {number} [now=Date.now()]
-   * @returns {{ ip: string, blockedAt: number, expiresAt: number, remainingMs: number, reason: string } | null}
+   * @param ip - Client IP
+   * @param now - Current timestamp
+   * @returns Block information or null
    */
-  getBlockInfo(ip, now = Date.now()) {
+  getBlockInfo(ip: string, now: number = Date.now()): BlockInfo | null {
     if (!this.isBlocked(ip, now)) {
       return null;
     }
 
     const cleanIp = normalizeIp(ip);
     const entry = this.blocks.get(cleanIp);
+    if (!entry) {
+      return null;
+    }
 
     return {
       ip: cleanIp,
@@ -242,12 +269,12 @@ class BlockManager {
   /**
    * Returns a list of all currently active blocked IPs.
    *
-   * @param {number} [now=Date.now()]
-   * @returns {Array<{ ip: string, blockedAt: number, expiresAt: number, remainingMs: number, reason: string }>}
+   * @param now - Current timestamp
+   * @returns Array of active block records
    */
-  listBlocks(now = Date.now()) {
+  listBlocks(now: number = Date.now()): BlockInfo[] {
     this.pruneExpired(now);
-    const result = [];
+    const result: BlockInfo[] = [];
     for (const [ip, entry] of this.blocks.entries()) {
       result.push({
         ip,
@@ -263,10 +290,10 @@ class BlockManager {
   /**
    * Scans and purges any expired blocks from memory.
    *
-   * @param {number} [now=Date.now()]
-   * @returns {number} Number of purged blocks
+   * @param now - Current timestamp
+   * @returns Number of purged blocks
    */
-  pruneExpired(now = Date.now()) {
+  pruneExpired(now: number = Date.now()): number {
     let pruned = 0;
     for (const [ip, entry] of this.blocks.entries()) {
       if (now >= entry.expiresAt) {
@@ -280,47 +307,28 @@ class BlockManager {
   /**
    * Clears all blocks from memory.
    */
-  clear() {
+  clear(): void {
     this.blocks.clear();
   }
 
   /**
    * Number of IPs currently stored in memory.
-   * @returns {number}
    */
-  get size() {
+  get size(): number {
     return this.blocks.size;
   }
 
   /**
    * Evicts the oldest entry to strictly uphold maxBlockedIps limit.
-   * @private
-   * @param {number} now
+   *
+   * @param _now - Current timestamp
    */
-  _evictOldest(now) {
-    const iterator = this.blocks.entries();
-    const first = iterator.next().value;
+  private _evictOldest(_now: number): void {
+    const iterator = this.blocks.keys();
+    const firstKey = iterator.next().value;
 
-    if (!first) {
-      return;
+    if (firstKey !== undefined) {
+      this.blocks.delete(firstKey);
     }
-
-    const [oldestIp, oldestEntry] = first;
-
-    // If oldest is already expired, delete it
-    if (now >= oldestEntry.expiresAt) {
-      this.blocks.delete(oldestIp);
-      return;
-    }
-
-    // Evict oldest LRU entry
-    this.blocks.delete(oldestIp);
   }
 }
-
-module.exports = {
-  BlockManager,
-  isValidIp,
-  normalizeIp,
-  parseDuration
-};

@@ -5,8 +5,8 @@ const assert = require('node:assert/strict');
 const http = require('node:http');
 const express = require('express');
 
-const { BlockManager, isValidIp, parseDuration } = require('../src/block-manager');
-const { createShield, resolveConfig } = require('../src/index');
+const { BlockManager, isValidIp, parseDuration } = require('../dist/block-manager');
+const { createShield, resolveConfig } = require('../dist/index');
 
 describe('Z-Shield Phase 3: Protection Mode & Temporary IP Blocking', () => {
 

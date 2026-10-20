@@ -10,7 +10,7 @@
  */
 
 const express = require('express');
-const { createShield } = require('../src/index');
+const { createShield } = require('../dist/index');
 
 const app = express();
 const PORT = process.env.PORT || 3000;

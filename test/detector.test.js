@@ -5,9 +5,9 @@ const assert = require('node:assert/strict');
 const http = require('node:http');
 const express = require('express');
 
-const { RateLimiter } = require('../src/rate-limiter');
-const { Detector } = require('../src/detector');
-const { createShield, resolveConfig } = require('../src/index');
+const { RateLimiter } = require('../dist/rate-limiter');
+const { Detector } = require('../dist/detector');
+const { createShield, resolveConfig } = require('../dist/index');
 
 describe('Z-Shield Phase 2: Request Detection & Bounded Counters', () => {
 
@@ -148,6 +148,26 @@ describe('Z-Shield Phase 2: Request Detection & Bounded Counters', () => {
 
       limiter.reset('2001:0DB8::1');
       assert.equal(limiter.get('2001:0db8::1').count, 0);
+    });
+
+    test('clears all tracked IP records from memory with clear()', () => {
+      const limiter = new RateLimiter({ maxRequests: 5 });
+
+      limiter.record('1.1.1.1');
+      limiter.record('2.2.2.2');
+      limiter.record('3.3.3.3');
+
+      assert.equal(limiter.size, 3);
+      assert.equal(limiter.get('1.1.1.1').count, 1);
+      assert.equal(limiter.get('2.2.2.2').count, 1);
+      assert.equal(limiter.get('3.3.3.3').count, 1);
+
+      limiter.clear();
+
+      assert.equal(limiter.size, 0);
+      assert.equal(limiter.get('1.1.1.1').count, 0);
+      assert.equal(limiter.get('2.2.2.2').count, 0);
+      assert.equal(limiter.get('3.3.3.3').count, 0);
     });
   });
 

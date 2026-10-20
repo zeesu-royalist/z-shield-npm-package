@@ -1,11 +1,17 @@
-'use strict';
-
-const { createMiddleware } = require('./middleware');
-const { resolveConfig, DEFAULT_CONFIG } = require('./config');
-const { RateLimiter } = require('./rate-limiter');
-const { Detector } = require('./detector');
-const { BlockManager } = require('./block-manager');
-const { Logger } = require('./logger');
+import { createMiddleware, extractClientIp, isRouteExcluded, safelyEndResponse } from './middleware';
+import { createNextShield, withNextShield, extractNextClientIp } from './next';
+import { resolveConfig, DEFAULT_CONFIG } from './config';
+import { RateLimiter } from './rate-limiter';
+import { Detector } from './detector';
+import { BlockManager, isValidIp, normalizeIp, parseDuration, type BlockInfo } from './block-manager';
+import { Logger, stripAnsi, sanitizeString, sanitizeRoute, sanitizeMethod } from './logger';
+import type {
+  ZShieldConfig,
+  ZShieldOptions,
+  BlockRecord,
+  ZShieldInstance,
+  ZShieldFullInstance
+} from './types';
 
 /**
  * Main factory function for initializing Z-Shield.
@@ -20,10 +26,10 @@ const { Logger } = require('./logger');
  *   shield.unblock('198.51.100.1');
  *   shield.isBlocked('198.51.100.1');
  *
- * @param {Object} [options={}] - Custom configuration options
- * @returns {Object} Z-Shield instance with middleware, managers, logger, and programmatic methods
+ * @param options - Custom configuration options
+ * @returns Z-Shield instance with middleware, managers, logger, and programmatic methods
  */
-function createShield(options = {}) {
+export function createShield(options: ZShieldOptions | ZShieldConfig = {}): ZShieldInstance {
   const config = resolveConfig(options);
   const rateLimiter = new RateLimiter(config);
   const detector = new Detector({ rateLimiter, config });
@@ -46,9 +52,9 @@ function createShield(options = {}) {
     logger,
 
     // Programmatic Block API with security event logging
-    block: (ip, duration, reason) => {
+    block: (ip: string, duration?: string | number, reason?: string): BlockRecord => {
       const result = blockManager.block(ip, duration, reason);
-      logger.log({
+      void logger.log({
         appName: config.appName,
         type: 'manual_block',
         severity: 'info',
@@ -61,10 +67,10 @@ function createShield(options = {}) {
       return result;
     },
 
-    unblock: (ip) => {
+    unblock: (ip: string): boolean => {
       const result = blockManager.unblock(ip);
       if (result) {
-        logger.log({
+        void logger.log({
           appName: config.appName,
           type: 'manual_unblock',
           severity: 'info',
@@ -78,20 +84,36 @@ function createShield(options = {}) {
       return result;
     },
 
-    isBlocked: (ip) => blockManager.isBlocked(ip),
-    getBlockInfo: (ip) => blockManager.getBlockInfo(ip),
-    listBlocks: () => blockManager.listBlocks(),
-    flush: () => logger.flush()
+    isBlocked: (ip: string): boolean => blockManager.isBlocked(ip),
+    getBlockInfo: (ip: string): BlockInfo | null => blockManager.getBlockInfo(ip),
+    listBlocks: (): BlockInfo[] => blockManager.listBlocks(),
+    flush: (): Promise<void> => logger.flush()
   };
 }
 
-module.exports = {
-  createShield,
+export {
   createMiddleware,
+  extractClientIp,
+  isRouteExcluded,
+  safelyEndResponse,
   resolveConfig,
   DEFAULT_CONFIG,
   RateLimiter,
   Detector,
   BlockManager,
-  Logger
+  isValidIp,
+  normalizeIp,
+  parseDuration,
+  Logger,
+  stripAnsi,
+  sanitizeString,
+  sanitizeRoute,
+  sanitizeMethod,
+  createNextShield,
+  withNextShield,
+  extractNextClientIp
 };
+
+export type { BlockInfo, ZShieldInstance, ZShieldFullInstance };
+export * from './types';
+

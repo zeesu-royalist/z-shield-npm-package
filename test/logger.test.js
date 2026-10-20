@@ -8,8 +8,8 @@ const os = require('node:os');
 const http = require('node:http');
 const express = require('express');
 
-const { Logger, sanitizeString, sanitizeRoute, sanitizeMethod, stripAnsi } = require('../src/logger');
-const { createShield, resolveConfig } = require('../src/index');
+const { Logger, sanitizeString, sanitizeRoute, sanitizeMethod, stripAnsi } = require('../dist/logger');
+const { createShield, resolveConfig } = require('../dist/index');
 
 describe('Z-Shield Phase 4: Persistent Local JSONL Security Event Logging', () => {
   let tempDir;
@@ -237,6 +237,27 @@ describe('Z-Shield Phase 4: Persistent Local JSONL Security Event Logging', () =
       const logFile = path.join(tempDir, 'events.jsonl');
       const lines = fs.readFileSync(logFile, 'utf8').trim().split('\n');
       assert.equal(lines.length, 2);
+    });
+
+    test('does not crash or throw unhandled rejection when onLogError callback itself throws', async () => {
+      // Force an EISDIR error by creating a directory where file is expected
+      const targetFilePath = path.join(tempDir, 'events-throw.jsonl');
+      fs.mkdirSync(targetFilePath);
+
+      let callbackInvoked = false;
+      const logger = new Logger({
+        logDir: tempDir,
+        logFilename: 'events-throw.jsonl',
+        onLogError: () => {
+          callbackInvoked = true;
+          throw new Error('Explosion inside user error handler!');
+        }
+      });
+
+      // Must safely catch the user callback exception, resolve to false, and not throw
+      const result = await logger.log({ ip: '198.51.100.99' });
+      assert.equal(result, false);
+      assert.equal(callbackInvoked, true);
     });
   });
 

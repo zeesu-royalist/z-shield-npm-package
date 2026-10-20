@@ -15,6 +15,7 @@
   - [What Z-Shield Does NOT Do](#what-z-shield-does-not-do)
 - [Requirements & Installation](#requirements--installation)
 - [Quick Start: Express Integration](#quick-start-express-integration)
+- [Quick Start: Next.js App Router Integration](#quick-start-nextjs-app-router-integration)
 - [Monitor Mode vs. Protect Mode](#monitor-mode-vs-protect-mode)
 - [Configuration Reference](#configuration-reference)
 - [Rate Limiting & HTTP Headers](#rate-limiting--http-headers)
@@ -114,6 +115,51 @@ app.listen(3000, () => {
 
 ---
 
+## Quick Start: Next.js App Router Integration
+
+Z-Shield provides native compatibility for Next.js App Router route handlers (`app/api/.../route.ts`) using Web-standard `Request` and `Response` objects.
+
+```typescript
+// app/api/protected/route.ts
+import { withNextShield } from 'z-shield';
+
+// CRITICAL: Z-Shield requires the Node.js runtime for file-based event logging.
+// It cannot run in the Edge runtime.
+export const runtime = 'nodejs';
+
+export const GET = withNextShield(
+  async (request: Request) => {
+    return Response.json({
+      success: true,
+      message: 'Access granted to protected Next.js API route'
+    });
+  },
+  {
+    mode: 'protect',
+    maxRequests: 50,
+    windowMs: 60000,
+    // Enable trustProxy and select your trusted reverse-proxy strategy
+    trustProxy: true,
+    getIp: 'cloudflare', // 'cloudflare' | 'x-real-ip' | 'x-forwarded-for' | 'akamai' | (req) => ...
+    appName: 'my-nextjs-app'
+  }
+);
+```
+
+### Next.js Architectural Notes
+- **Node.js Runtime Requirement**: Z-Shield relies on Node.js filesystem APIs for non-blocking JSONL event logging and `node:net` for strict IP validation. Always declare `export const runtime = 'nodejs';`.
+- **Trusted Proxies & `getIp` Strategy**:
+  When deploying behind reverse proxies, set `trustProxy: true` AND explicitly specify your provider's extraction strategy using `getIp`:
+  - `'cloudflare'` / `'cf-connecting-ip'`: Inspects only `CF-Connecting-IP`.
+  - `'nginx'` / `'x-real-ip'`: Inspects only `X-Real-IP`.
+  - `'akamai'` / `'true-client-ip'`: Inspects only `True-Client-IP`.
+  - `'x-forwarded-for'`: Inspects the first valid IP from `X-Forwarded-For` (requires outermost reverse proxy to strip or sanitize client-provided headers).
+  - Custom function: `getIp: (req) => string | null | undefined`.
+  *Fail-Safe Behavior*: If `trustProxy: true` is configured without specifying a `getIp` strategy, Z-Shield strictly refuses to guess across foreign proxy headers and safely falls back to `'unknown'` (or direct TCP socket if available). Unconfigured reverse-proxy headers and unverified platform properties are never trusted.
+- **Process-Local Memory in Serverless**: Rate limit counters and temporary IP blocks are stored in-memory per Node.js process (bounded by LRU). In serverless environments, each active instance tracks traffic locally.
+
+---
+
 ## Monitor Mode vs. Protect Mode
 
 Z-Shield provides two operational modes:
@@ -172,7 +218,8 @@ const shield = createShield({
   autoBlock: false,
 
   // Whether to trust reverse-proxy headers (e.g. X-Forwarded-For)
-  // WARNING: Set to true only if behind a verified reverse proxy
+  // WARNING: Set to true only if behind a verified reverse proxy.
+  // In Next.js App Router, also pair with 'getIp' strategy (e.g. 'cloudflare', 'nginx', 'x-forwarded-for')
   trustProxy: false,
 
   // Array of route prefixes that bypass tracking
@@ -300,13 +347,31 @@ npx z-shield block 198.51.100.1 --duration 10m
 npx z-shield unblock 198.51.100.1
 ```
 
-### Process-Local Architecture Notice
-Z-Shield stores active IP counters and temporary blocks **in server memory (RAM)** inside your Express application process.
+### Log Directory Resolution & Environment Variables
+By default, the CLI looks for logs in `.z-shield-logs/events.jsonl` in your current working directory. You can customize the log directory using either the CLI flag or environment variable:
 
-Because the CLI runs in an independent Node.js process, it cannot reach into your Express application's memory heap to alter active blocks. When you execute `npx z-shield block`, the CLI:
+1. **CLI Flag (`--log-dir`)** (Highest precedence):
+   ```bash
+   npx z-shield status --log-dir /var/log/my-app
+   npx z-shield logs --log-dir /var/log/my-app
+   ```
+2. **Environment Variable (`Z_SHIELD_LOG_DIR`)** (Second precedence):
+   ```bash
+   export Z_SHIELD_LOG_DIR=/var/log/my-app
+   npx z-shield status
+   ```
+3. **Default Location** (Fallback):
+   `./.z-shield-logs/events.jsonl`
+
+When no log file is found, the CLI prints a helpful status message with the checked path and guidance on how to run your application or specify custom paths.
+
+### Process-Local Architecture Notice
+Z-Shield stores active IP counters and temporary blocks **in server memory (RAM)** inside your Express or Next.js application process.
+
+Because the CLI runs in an independent Node.js process, it cannot reach into your running application's memory heap to alter active in-memory counters. When you execute `npx z-shield block`, the CLI:
 1. Validates the IP and duration.
-2. Writes an audit entry to `.z-shield-logs/events.jsonl`.
-3. Displays the exact JavaScript snippet to invoke inside your Express code (`shield.block(...)`).
+2. Writes an audit entry to the active security log file.
+3. Displays the exact programmatic snippet to invoke inside your application code (`shield.block(...)`).
 
 ---
 
@@ -335,6 +400,24 @@ const shield = createShield({
 });
 app.use(shield.middleware);
 ```
+
+### Next.js Client IP Extraction & Reverse Proxy Requirements
+In Next.js App Router route handlers, standard Web `Request` objects do not carry Node.js TCP sockets. Z-Shield enforces the following security model:
+
+1. **`trustProxy: false` (Default)**:
+   - Untrusted reverse-proxy headers (`X-Forwarded-For`, `X-Real-IP`, `CF-Connecting-IP`, `True-Client-IP`, etc.) and unverified platform properties are strictly ignored to prevent client IP spoofing attacks.
+   - If a direct Node.js TCP socket is available (`req.socket.remoteAddress`), it is used.
+   - **Deployment Limitation**: In environments without a direct TCP socket (e.g. serverless functions without trusted proxies), safe client IP identification cannot be guaranteed, and Z-Shield safely falls back to `'unknown'`.
+
+2. **`trustProxy: true`**:
+   - To prevent forged header injection across reverse proxies (e.g. an attacker sending `CF-Connecting-IP` to an Nginx server that passes unmanaged headers through), Z-Shield **strictly requires selecting an explicit trusted proxy strategy via `getIp`** (or providing a custom function):
+     - `'cloudflare'` | `'cf-connecting-ip'`: Inspects only `CF-Connecting-IP` and strictly ignores all other proxy headers.
+     - `'nginx'` | `'x-real-ip'`: Inspects only `X-Real-IP` and strictly ignores all other proxy headers.
+     - `'akamai'` | `'true-client-ip'`: Inspects only `True-Client-IP` and strictly ignores all other proxy headers.
+     - `'x-forwarded-for'`: Inspects only `X-Forwarded-For`, parsing candidates and taking the first valid IP.
+     - Custom extractor: `(req: Request) => string | null | undefined`.
+   - **Crucial Reverse-Proxy Requirement**: When using `'x-forwarded-for'` with an appending reverse proxy (such as default Nginx `$proxy_add_x_forwarded_for`), your edge proxy **MUST** strip client-supplied `X-Forwarded-For` headers at network ingress; otherwise, an attacker can prepend a forged IP. If your proxy cannot strip incoming headers, configure `'x-real-ip'` or provide a custom `getIp` function.
+   - **Fail-Safe Behavior**: If `trustProxy: true` is configured without specifying `getIp`, Z-Shield strictly refuses to guess which header is authentic, and safely falls back to `'unknown'` (or direct TCP socket if available). Unconfigured reverse-proxy headers and unverified platform properties are never trusted.
 
 ---
 

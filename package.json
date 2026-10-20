@@ -2,11 +2,24 @@
   "name": "z-shield",
   "version": "0.1.1",
   "description": "API abuse detection, rate limiting, and temporary IP blocking middleware for Node.js and Express",
-  "main": "src/index.js",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./next": {
+      "types": "./dist/next.d.ts",
+      "default": "./dist/next.js"
+    }
+  },
   "bin": {
-    "z-shield": "src/cli.js"
+    "z-shield": "dist/cli.js"
   },
   "scripts": {
+    "build": "tsc",
+    "pretest": "npm run build",
     "test": "node --test test/*.test.js",
     "start": "node examples/express-app.js"
   },
@@ -29,13 +42,16 @@
   "author": "zeesu-royalist (https://zeesu-royalist.vercel.app)",
   "license": "MIT",
   "files": [
-    "src",
+    "dist",
     "README.md",
     "LICENSE",
     "SECURITY.md"
   ],
   "devDependencies": {
-    "express": "^4.21.2"
+    "@types/express": "^5.0.6",
+    "@types/node": "^26.6.5",
+    "express": "^4.21.2",
+    "typescript": "^7.0.2"
   },
   "engines": {
     "node": ">=18.0.0"

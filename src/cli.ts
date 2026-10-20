@@ -1,24 +1,69 @@
 #!/usr/bin/env node
-'use strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import net from 'node:net';
+import { stripAnsi, sanitizeString, sanitizeRoute } from './logger';
+import { parseDuration, isValidIp, normalizeIp } from './block-manager';
 
-const fs = require('node:fs');
-const path = require('node:path');
-const net = require('node:net');
-const readline = require('node:readline');
+export interface ParsedCliArgs {
+  command: string;
+  args: string[];
+  options: Record<string, string | boolean>;
+}
 
-const { stripAnsi, sanitizeString, sanitizeRoute, sanitizeMethod } = require('./logger');
-const { parseDuration, isValidIp, normalizeIp } = require('./block-manager');
+export type ColorFormatter = (str: string | number | undefined | null) => string;
+
+export interface ColorMap {
+  bold: ColorFormatter;
+  dim: ColorFormatter;
+  italic: ColorFormatter;
+  underline: ColorFormatter;
+  inverse: ColorFormatter;
+  red: ColorFormatter;
+  green: ColorFormatter;
+  yellow: ColorFormatter;
+  blue: ColorFormatter;
+  magenta: ColorFormatter;
+  cyan: ColorFormatter;
+  white: ColorFormatter;
+  gray: ColorFormatter;
+  enabled: boolean;
+  hasColors: boolean;
+}
+
+export interface CliOutput {
+  log: (...args: unknown[]) => void;
+  error: (...args: unknown[]) => void;
+  isTTY?: boolean;
+}
+
+export interface LogReadResult {
+  events: Record<string, unknown>[];
+  totalLines: number;
+  malformedCount: number;
+  fileExists: boolean;
+}
+
+export interface StatusResult {
+  fileExists: boolean;
+  totalEvents: number;
+  malformedCount?: number;
+  typeCounts?: Record<string, number>;
+  actionCounts?: Record<string, number>;
+  topIps?: Array<{ ip: string; count: number }>;
+  topRoutes?: Array<{ route: string; count: number }>;
+}
 
 /**
  * Parses raw command-line arguments into a structured command object.
  *
- * @param {string[]} argv - Array of CLI arguments (typically process.argv.slice(2))
- * @returns {{ command: string, args: string[], options: Record<string, string|boolean> }}
+ * @param argv - Array of CLI arguments (typically process.argv.slice(2))
+ * @returns Structured CLI command, positional args, and parsed options
  */
-function parseCliArgs(argv = []) {
+export function parseCliArgs(argv: string[] = []): ParsedCliArgs {
   let command = 'help';
-  const args = [];
-  const options = {};
+  const args: string[] = [];
+  const options: Record<string, string | boolean> = {};
 
   let i = 0;
   // If first non-flag argument exists, it's the command
@@ -54,12 +99,32 @@ function parseCliArgs(argv = []) {
 /**
  * Resolves the target JSON Lines log file path based on CLI options or defaults.
  *
- * @param {Record<string, any>} options
- * @returns {string} Absolute path to events.jsonl
+ * @param options - Parsed CLI options
+ * @returns Absolute path to events.jsonl
  */
-function resolveLogPath(options = {}) {
-  const logDir = path.resolve(options['log-dir'] || options.logDir || path.join(process.cwd(), '.z-shield-logs'));
-  const filename = options['log-file'] || options.logFile || 'events.jsonl';
+export function resolveLogPath(options: Record<string, unknown> = {}): string {
+  const logDirOption = (options['log-dir'] || options.logDir) as string | undefined;
+  const envLogDir = process.env.Z_SHIELD_LOG_DIR;
+  const filenameOption = (options['log-file'] || options.logFile) as string | undefined;
+
+  // Precedence:
+  // 1. Explicit CLI option: --log-dir / --logDir
+  // 2. Environment variable: Z_SHIELD_LOG_DIR (if non-empty)
+  // 3. Default: .z-shield-logs in current working directory
+  let targetDir: string;
+  if (typeof logDirOption === 'string' && logDirOption.trim().length > 0) {
+    targetDir = logDirOption.trim();
+  } else if (typeof envLogDir === 'string' && envLogDir.trim().length > 0) {
+    targetDir = envLogDir.trim();
+  } else {
+    targetDir = path.join(process.cwd(), '.z-shield-logs');
+  }
+
+  const logDir = path.resolve(targetDir);
+  const filename = typeof filenameOption === 'string' && filenameOption.trim().length > 0
+    ? filenameOption.trim()
+    : 'events.jsonl';
+
   return path.join(logDir, filename);
 }
 
@@ -67,12 +132,12 @@ function resolveLogPath(options = {}) {
  * Creates an ANSI color styling helper object.
  * When enabled is false, all styling methods act as plain passthroughs.
  *
- * @param {boolean} [enabled=true]
- * @returns {Record<string, (str: string|number) => string>}
+ * @param enabled - Whether color styling is active
+ * @returns Color styling map
  */
-function createColors(enabled = true) {
+export function createColors(enabled: boolean = true): ColorMap {
   if (!enabled) {
-    const pass = (str) => String(str ?? '');
+    const pass: ColorFormatter = (str) => String(str ?? '');
     return {
       bold: pass,
       dim: pass,
@@ -92,7 +157,8 @@ function createColors(enabled = true) {
     };
   }
 
-  const wrap = (open, close) => (str) => `\x1b[${open}m${str ?? ''}\x1b[${close}m`;
+  const wrap = (open: number, close: number): ColorFormatter =>
+    (str) => `\x1b[${open}m${str ?? ''}\x1b[${close}m`;
 
   return {
     bold: wrap(1, 22),
@@ -119,11 +185,14 @@ function createColors(enabled = true) {
  *
  * Respects the standard NO_COLOR specification (https://no-color.org).
  *
- * @param {Record<string, any>} [options={}]
- * @param {Console|Object} [output=null]
- * @returns {boolean}
+ * @param options - Parsed CLI options
+ * @param output - Output destination (console or mock stream)
+ * @returns True if colors should be enabled
  */
-function resolveColorSupport(options = {}, output = null) {
+export function resolveColorSupport(
+  options: Record<string, unknown> = {},
+  output: CliOutput | Console | null = null
+): boolean {
   // 1. Explicit CLI flags
   if (
     options['no-color'] ||
@@ -162,7 +231,7 @@ function resolveColorSupport(options = {}, output = null) {
 
   // 5. If output is a custom test mock or stream without TTY, disable colors by default
   if (output && output !== console) {
-    return Boolean(output.isTTY);
+    return Boolean((output as CliOutput).isTTY);
   }
 
   // 6. Interactive terminal check
@@ -173,11 +242,14 @@ function resolveColorSupport(options = {}, output = null) {
  * Formats a single security event record into a clean, sanitized terminal line.
  * Strips all ANSI escapes and control characters from untrusted log fields before formatting.
  *
- * @param {Object} event
- * @param {Object|boolean} [options={}] - Options object or boolean for color
- * @returns {string} Sanitized output line
+ * @param event - Security event object
+ * @param options - Options object or boolean for color
+ * @returns Sanitized output line
  */
-function formatLogEvent(event, options = {}) {
+export function formatLogEvent(
+  event: Record<string, unknown> | null | undefined,
+  options: Record<string, unknown> | boolean = {}
+): string {
   if (!event || typeof event !== 'object') {
     return '[Malformed Event]';
   }
@@ -200,16 +272,16 @@ function formatLogEvent(event, options = {}) {
 
   // Sanitize untrusted log values first to prevent terminal injection
   const timestamp = sanitizeString(event.timestamp || 'UNKNOWN-TIME', 30);
-  const severity = sanitizeString((event.severity || 'INFO').toUpperCase(), 10);
+  const severity = sanitizeString((event.severity || 'INFO'), 10).toUpperCase();
   const type = sanitizeString(event.type || 'unknown', 20);
-  const rawAction = (event.action || 'unknown').toUpperCase();
+  const rawAction = String(event.action || 'unknown').toUpperCase();
   const normalizedAction = rawAction === 'WARN' ? 'WARNED'
     : rawAction === 'BLOCK' ? 'BLOCKED'
     : rawAction === 'ALLOW' ? 'ALLOWED'
     : rawAction;
   const action = sanitizeString(normalizedAction, 10);
   const ip = sanitizeString(event.ip || 'unknown', 45);
-  const method = sanitizeString((event.method || 'GET').toUpperCase(), 10);
+  const method = sanitizeString(event.method || 'GET', 10).toUpperCase();
   const route = sanitizeString(event.route || '/', 100);
   const reason = sanitizeString(event.reason || 'No details', 150);
 
@@ -218,7 +290,7 @@ function formatLogEvent(event, options = {}) {
   }
 
   // Action badge with semantic color
-  let styledAction;
+  let styledAction: string;
   switch (action) {
     case 'BLOCKED': styledAction = c.bold(c.red(`[${action}]`)); break;
     case 'WARNED': styledAction = c.bold(c.yellow(`[${action}]`)); break;
@@ -229,7 +301,7 @@ function formatLogEvent(event, options = {}) {
   }
 
   // Severity badge with semantic color
-  let styledSeverity;
+  let styledSeverity: string;
   switch (severity) {
     case 'CRITICAL': styledSeverity = c.bold(c.red(`[${severity}]`)); break;
     case 'WARNING': styledSeverity = c.bold(c.yellow(`[${severity}]`)); break;
@@ -250,11 +322,11 @@ function formatLogEvent(event, options = {}) {
  * Reads and parses the last N records from the JSON Lines file.
  * Handles missing files and skips malformed records gracefully.
  *
- * @param {string} logFilePath
- * @param {number} [limit=20]
- * @returns {{ events: Object[], totalLines: number, malformedCount: number, fileExists: boolean }}
+ * @param logFilePath - Path to log file
+ * @param limit - Max number of events to return
+ * @returns Extracted events and counts
  */
-function readLogs(logFilePath, limit = 20) {
+export function readLogs(logFilePath: string, limit: number = 20): LogReadResult {
   if (!fs.existsSync(logFilePath)) {
     return { events: [], totalLines: 0, malformedCount: 0, fileExists: false };
   }
@@ -263,11 +335,11 @@ function readLogs(logFilePath, limit = 20) {
   const rawLines = rawContent.split('\n').filter(line => line.trim().length > 0);
 
   let malformedCount = 0;
-  const parsedEvents = [];
+  const parsedEvents: Record<string, unknown>[] = [];
 
   for (const line of rawLines) {
     try {
-      const parsed = JSON.parse(line);
+      const parsed = JSON.parse(line) as Record<string, unknown>;
       parsedEvents.push(parsed);
     } catch {
       malformedCount++;
@@ -288,10 +360,10 @@ function readLogs(logFilePath, limit = 20) {
  * Sanitizes untrusted IP address values from logs for safe status aggregation and output.
  * Strips ANSI escapes, truncates at newlines/control characters, and extracts valid IP addresses.
  *
- * @param {*} rawIp
- * @returns {string} Normalized IP address or 'unknown'
+ * @param rawIp - Untrusted IP candidate from logs
+ * @returns Normalized IP address or 'unknown'
  */
-function sanitizeIp(rawIp) {
+export function sanitizeIp(rawIp: unknown): string {
   if (!rawIp || typeof rawIp !== 'string') return 'unknown';
   const trimmed = rawIp.trim();
   if (trimmed.length === 0) return 'unknown';
@@ -330,11 +402,11 @@ function sanitizeIp(rawIp) {
 /**
  * Sanitizes untrusted event type strings from logs.
  *
- * @param {*} rawType
- * @param {number} [maxLength=30]
- * @returns {string} Clean event type string
+ * @param rawType - Untrusted event type string
+ * @param maxLength - Maximum permitted length
+ * @returns Clean event type string
  */
-function sanitizeType(rawType, maxLength = 30) {
+export function sanitizeType(rawType: unknown, maxLength: number = 30): string {
   if (!rawType || typeof rawType !== 'string') return 'unknown';
   let clean = rawType.split(/[\r\n\x1b]/)[0];
   clean = stripAnsi(clean);
@@ -346,11 +418,11 @@ function sanitizeType(rawType, maxLength = 30) {
 /**
  * Sanitizes untrusted action strings from logs.
  *
- * @param {*} rawAction
- * @param {number} [maxLength=20]
- * @returns {string} Clean action string
+ * @param rawAction - Untrusted action string
+ * @param maxLength - Maximum permitted length
+ * @returns Clean action string
  */
-function sanitizeAction(rawAction, maxLength = 20) {
+export function sanitizeAction(rawAction: unknown, maxLength: number = 20): string {
   if (!rawAction || typeof rawAction !== 'string') return 'unknown';
   let clean = rawAction.split(/[\r\n\x1b]/)[0];
   clean = stripAnsi(clean);
@@ -364,20 +436,20 @@ function sanitizeAction(rawAction, maxLength = 20) {
 /**
  * Computes security summary statistics from the log file.
  *
- * @param {string} logFilePath
- * @returns {Object}
+ * @param logFilePath - Path to log file
+ * @returns Summary metrics
  */
-function calculateStatus(logFilePath) {
+export function calculateStatus(logFilePath: string): StatusResult {
   if (!fs.existsSync(logFilePath)) {
     return { fileExists: false, totalEvents: 0 };
   }
 
   const { events: allEvents, malformedCount } = readLogs(logFilePath, 100000);
 
-  const ipCounts = Object.create(null);
-  const routeCounts = Object.create(null);
-  const typeCounts = Object.create(null);
-  const actionCounts = Object.create(null);
+  const ipCounts = Object.create(null) as Record<string, number>;
+  const routeCounts = Object.create(null) as Record<string, number>;
+  const typeCounts = Object.create(null) as Record<string, number>;
+  const actionCounts = Object.create(null) as Record<string, number>;
 
   for (const event of allEvents) {
     const ip = sanitizeIp(event.ip);
@@ -416,11 +488,14 @@ function calculateStatus(logFilePath) {
 /**
  * Main command runner. Returns an exit code (0 for success, 1 for error).
  *
- * @param {string[]} argv
- * @param {Console|Object} [output=console]
- * @returns {Promise<number>} Exit code
+ * @param argv - Arguments array
+ * @param output - Output destination (console or mock object)
+ * @returns Exit code
  */
-async function runCommand(argv = process.argv.slice(2), output = console) {
+export async function runCommand(
+  argv: string[] = process.argv.slice(2),
+  output: CliOutput | Console = console
+): Promise<number> {
   const { command, args, options } = parseCliArgs(argv);
   const logFilePath = resolveLogPath(options);
   const useColors = resolveColorSupport(options, output);
@@ -437,36 +512,44 @@ async function runCommand(argv = process.argv.slice(2), output = console) {
 
       if (!status.fileExists) {
         output.log(`${c.bold('Status:')}   ${c.yellow('No log file found yet.')}`);
-        output.log(c.dim('ℹ Start your Express server to begin logging security events.'));
+        output.log(`\n${c.bold('Checked Location:')} ${c.gray(logFilePath)}`);
+        output.log(c.dim('ℹ Start your Express or Next.js server to begin logging security events.'));
+        output.log(c.dim('  If your application stores logs in a custom directory, specify it with:'));
+        output.log(c.dim('    • CLI flag:             z-shield status --log-dir <path>'));
+        output.log(c.dim('    • Environment variable: Z_SHIELD_LOG_DIR=<path> z-shield status'));
         output.log(c.cyan('====================================================\n'));
         return 0;
       }
 
       output.log(`${c.bold('Total Events Recorded:')} ${c.bold(c.cyan(status.totalEvents))}`);
-      if (status.malformedCount > 0) {
+      if (status.malformedCount && status.malformedCount > 0) {
         output.log(`${c.bold(c.yellow('⚠️  Malformed Lines Skipped:'))} ${c.yellow(status.malformedCount)}`);
       }
 
       output.log(`\n${c.bold('Actions Breakdown:')}`);
-      for (const [action, count] of Object.entries(status.actionCounts)) {
-        const cleanAction = sanitizeAction(action);
-        const upper = cleanAction.toUpperCase();
-        let styledAction = upper;
-        if (upper === 'BLOCKED') styledAction = c.bold(c.red(upper));
-        else if (upper === 'WARNED') styledAction = c.bold(c.yellow(upper));
-        else if (upper === 'ALLOWED') styledAction = c.bold(c.green(upper));
-        else if (upper === 'UNBLOCKED') styledAction = c.bold(c.cyan(upper));
-        else if (upper === 'REQUESTED') styledAction = c.bold(c.blue(upper));
-        output.log(`  - ${styledAction}: ${c.bold(count)}`);
+      if (status.actionCounts) {
+        for (const [action, count] of Object.entries(status.actionCounts)) {
+          const cleanAction = sanitizeAction(action);
+          const upper = cleanAction.toUpperCase();
+          let styledAction = upper;
+          if (upper === 'BLOCKED') styledAction = c.bold(c.red(upper));
+          else if (upper === 'WARNED') styledAction = c.bold(c.yellow(upper));
+          else if (upper === 'ALLOWED') styledAction = c.bold(c.green(upper));
+          else if (upper === 'UNBLOCKED') styledAction = c.bold(c.cyan(upper));
+          else if (upper === 'REQUESTED') styledAction = c.bold(c.blue(upper));
+          output.log(`  - ${styledAction}: ${c.bold(count)}`);
+        }
       }
 
       output.log(`\n${c.bold('Event Types:')}`);
-      for (const [type, count] of Object.entries(status.typeCounts)) {
-        const cleanType = sanitizeType(type);
-        output.log(`  - ${c.yellow(cleanType)}: ${c.bold(count)}`);
+      if (status.typeCounts) {
+        for (const [type, count] of Object.entries(status.typeCounts)) {
+          const cleanType = sanitizeType(type);
+          output.log(`  - ${c.yellow(cleanType)}: ${c.bold(count)}`);
+        }
       }
 
-      if (status.topIps.length > 0) {
+      if (status.topIps && status.topIps.length > 0) {
         output.log(`\n${c.bold('Top Offending IPs:')}`);
         for (const item of status.topIps) {
           const cleanIp = sanitizeIp(item.ip);
@@ -474,7 +557,7 @@ async function runCommand(argv = process.argv.slice(2), output = console) {
         }
       }
 
-      if (status.topRoutes.length > 0) {
+      if (status.topRoutes && status.topRoutes.length > 0) {
         output.log(`\n${c.bold('Top Targeted Routes:')}`);
         for (const item of status.topRoutes) {
           const cleanRoute = sanitizeRoute(item.route);
@@ -494,7 +577,7 @@ async function runCommand(argv = process.argv.slice(2), output = console) {
     case 'logs': {
       let limit = 20;
       if (options.limit) {
-        const parsed = parseInt(options.limit, 10);
+        const parsed = parseInt(String(options.limit), 10);
         if (isNaN(parsed) || parsed <= 0) {
           output.error(c.bold(c.red('[ERROR] --limit must be a positive integer.')));
           return 1;
@@ -510,7 +593,15 @@ async function runCommand(argv = process.argv.slice(2), output = console) {
       output.log(c.cyan('===================================================='));
 
       if (!fileExists || events.length === 0) {
-        output.log(c.dim('ℹ No security events found in log file.'));
+        if (!fileExists) {
+          output.log(c.yellow(`ℹ No log file found at: ${logFilePath}`));
+          output.log(c.dim('  Ensure your Express or Next.js server has started and recorded events.'));
+          output.log(c.dim('  If your logs are stored in a custom directory, specify it with:'));
+          output.log(c.dim('    • CLI flag:             z-shield logs --log-dir <path>'));
+          output.log(c.dim('    • Environment variable: Z_SHIELD_LOG_DIR=<path> z-shield logs'));
+        } else {
+          output.log(c.dim('ℹ No security events found in log file.'));
+        }
         output.log(c.cyan('===================================================='));
         return 0;
       }
@@ -547,7 +638,8 @@ async function runCommand(argv = process.argv.slice(2), output = console) {
           output.log(c.dim('--- Live Stream Active ---'));
         }
       } else {
-        output.log(c.dim('ℹ Waiting for server to create log file...'));
+        output.log(c.yellow(`ℹ Waiting for log file to be created at: ${logFilePath}`));
+        output.log(c.dim('  Tip: You can specify a custom directory with --log-dir <path> or Z_SHIELD_LOG_DIR=<path>.'));
       }
 
       // Live watcher polling function
@@ -570,11 +662,11 @@ async function runCommand(argv = process.argv.slice(2), output = console) {
             stream.on('data', chunk => {
               buffer += chunk;
               const lines = buffer.split('\n');
-              buffer = lines.pop(); // keep last partial line
+              buffer = lines.pop() || ''; // keep last partial line
               for (const line of lines) {
                 if (line.trim().length > 0) {
                   try {
-                    const parsed = JSON.parse(line);
+                    const parsed = JSON.parse(line) as Record<string, unknown>;
                     output.log(formatLogEvent(parsed, { colors: useColors }));
                   } catch {
                     output.log(c.yellow('[⚠️ Corrupted log record]'));
@@ -595,7 +687,7 @@ async function runCommand(argv = process.argv.slice(2), output = console) {
       const interval = setInterval(checkNewLines, 300);
 
       // Clean exit on SIGINT (Ctrl+C)
-      return new Promise((resolve) => {
+      return new Promise<number>((resolve) => {
         const cleanup = () => {
           clearInterval(interval);
           output.log(`\n${c.cyan('👋 Exiting Z-Shield live monitor.')}`);
@@ -619,16 +711,16 @@ async function runCommand(argv = process.argv.slice(2), output = console) {
         return 1;
       }
 
-      const durationRaw = options.duration || '15m';
-      let durationMs;
+      const durationRaw = (options.duration as string) || '15m';
+      let durationMs: number;
       try {
         durationMs = parseDuration(durationRaw);
       } catch (err) {
-        output.error(c.bold(c.red(`[ERROR] ${err.message}`)));
+        output.error(c.bold(c.red(`[ERROR] ${(err as Error).message}`)));
         return 1;
       }
 
-      const reason = options.reason || 'Manual block requested via CLI';
+      const reason = (options.reason as string) || 'Manual block requested via CLI';
 
       output.log(c.cyan('\n\n===================================================='));
       output.log(c.bold(c.cyan('🛡️  Z-Shield CLI: Block Request')));
@@ -734,6 +826,8 @@ async function runCommand(argv = process.argv.slice(2), output = console) {
       output.log(`  ${c.yellow('--color')}                            Force enable colored terminal output`);
       output.log(`  ${c.yellow('--no-color')}                         Disable colored terminal output`);
       output.log(`  ${c.yellow('--help, -h')}                         Display this help message`);
+      output.log(`\n${c.bold('Environment Variables:')}`);
+      output.log(`  ${c.yellow('Z_SHIELD_LOG_DIR')}                    Default log directory path when --log-dir is omitted`);
       output.log(c.cyan('===================================================='));
       return command === 'help' ? 0 : 1;
     }
@@ -748,17 +842,3 @@ if (require.main === module) {
     }
   });
 }
-
-module.exports = {
-  createColors,
-  resolveColorSupport,
-  parseCliArgs,
-  formatLogEvent,
-  readLogs,
-  calculateStatus,
-  resolveLogPath,
-  runCommand,
-  sanitizeIp,
-  sanitizeType,
-  sanitizeAction
-};

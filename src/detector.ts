@@ -1,4 +1,30 @@
-'use strict';
+import type { RateLimiter } from './rate-limiter';
+import type { ZShieldConfig } from './types';
+
+export interface DetectorOptions {
+  rateLimiter: RateLimiter;
+  config: ZShieldConfig;
+}
+
+export interface CheckResult {
+  isSuspicious: boolean;
+  type: string;
+  severity: string;
+  reason: string | null;
+  count: number;
+  maxRequests: number;
+  remaining: number;
+  resetTime: number;
+  timestamp: string;
+}
+
+export interface InspectResult {
+  isSuspicious: boolean;
+  count: number;
+  maxRequests: number;
+  remaining: number;
+  resetTime: number;
+}
 
 /**
  * Detector - Evaluates incoming requests and detects abuse patterns.
@@ -6,13 +32,14 @@
  * In Phase 2, this evaluates whether a client IP has exceeded the
  * maximum request threshold within the configured time window.
  */
-class Detector {
+export class Detector {
+  readonly rateLimiter: RateLimiter;
+  readonly config: ZShieldConfig;
+
   /**
-   * @param {Object} options
-   * @param {import('./rate-limiter').RateLimiter} options.rateLimiter - The rate-limiter instance
-   * @param {Object} options.config - The resolved Z-Shield configuration
+   * @param options - Configuration containing rateLimiter and resolved config
    */
-  constructor({ rateLimiter, config }) {
+  constructor({ rateLimiter, config }: DetectorOptions) {
     if (!rateLimiter) {
       throw new TypeError('[Z-Shield] Detector requires a RateLimiter instance.');
     }
@@ -27,12 +54,12 @@ class Detector {
   /**
    * Checks an incoming request against detection rules.
    *
-   * @param {string} ip - Client IP address
-   * @param {import('express').Request} [req={}] - Express request object
-   * @param {number} [now=Date.now()] - Timestamp
-   * @returns {Object} Detection evaluation result
+   * @param ip - Client IP address
+   * @param req - Request object (Express Request or standard Request)
+   * @param now - Timestamp
+   * @returns Detection evaluation result
    */
-  check(ip, req = {}, now = Date.now()) {
+  check(ip: string, req: unknown = {}, now: number = Date.now()): CheckResult {
     const status = this.rateLimiter.record(ip, now);
 
     if (status.isExceeded) {
@@ -66,11 +93,11 @@ class Detector {
   /**
    * Inspects current status without incrementing counters.
    *
-   * @param {string} ip
-   * @param {number} [now=Date.now()]
-   * @returns {Object}
+   * @param ip - Client IP address
+   * @param now - Timestamp
+   * @returns Inspection status
    */
-  inspect(ip, now = Date.now()) {
+  inspect(ip: string, now: number = Date.now()): InspectResult {
     const status = this.rateLimiter.get(ip, now);
 
     return {
@@ -82,7 +109,3 @@ class Detector {
     };
   }
 }
-
-module.exports = {
-  Detector
-};

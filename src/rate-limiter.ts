@@ -1,6 +1,16 @@
-'use strict';
+import { normalizeIp } from './block-manager';
+import type { RateLimitStatus, ZShieldConfig, ZShieldOptions } from './types';
 
-const { normalizeIp } = require('./block-manager');
+export interface RateLimiterOptions {
+  windowMs?: number;
+  maxRequests?: number;
+  maxTrackedIps?: number;
+}
+
+interface CounterEntry {
+  count: number;
+  resetTime: number;
+}
 
 /**
  * RateLimiter - Bounded In-Memory Request Counter
@@ -16,37 +26,38 @@ const { normalizeIp } = require('./block-manager');
  * - If the number of tracked IPs reaches `maxTrackedIps`, we evict the oldest entry.
  *   This ensures memory consumption is strictly bounded and cannot crash the Node.js process.
  */
-class RateLimiter {
+export class RateLimiter {
+  readonly windowMs: number;
+  readonly maxRequests: number;
+  readonly maxTrackedIps: number;
+  private readonly records: Map<string, CounterEntry>;
+
   /**
-   * @param {Object} options
-   * @param {number} [options.windowMs=60000] - Window length in milliseconds
-   * @param {number} [options.maxRequests=100] - Max allowed requests per window
-   * @param {number} [options.maxTrackedIps=10000] - Maximum unique IPs tracked in memory
+   * @param options - Limiter options or resolved configuration
    */
-  constructor(options = {}) {
+  constructor(options: RateLimiterOptions | ZShieldConfig | ZShieldOptions = {}) {
     this.windowMs = options.windowMs || 60000;
     this.maxRequests = options.maxRequests || 100;
     this.maxTrackedIps = options.maxTrackedIps || 10000;
 
-    /** @type {Map<string, { count: number, resetTime: number }>} */
-    this.records = new Map();
+    this.records = new Map<string, CounterEntry>();
   }
 
   /**
    * Records an incoming request from an IP address.
    *
-   * @param {string} ip - Client IP address
-   * @param {number} [now=Date.now()] - Current timestamp (injectable for testing)
-   * @returns {{ count: number, remaining: number, resetTime: number, isExceeded: boolean }}
+   * @param ip - Client IP address
+   * @param now - Current timestamp (injectable for testing)
+   * @returns Current rate limit status
    */
-  record(ip, now = Date.now()) {
+  record(ip: string, now: number = Date.now()): RateLimitStatus {
     const cleanIp = normalizeIp(ip);
 
     let entry = this.records.get(cleanIp);
 
     // If an existing entry has expired, treat it as a fresh window
     if (entry && now >= entry.resetTime) {
-      entry = null;
+      entry = undefined;
     }
 
     if (entry) {
@@ -86,11 +97,11 @@ class RateLimiter {
   /**
    * Inspects current status for an IP without incrementing its counter.
    *
-   * @param {string} ip
-   * @param {number} [now=Date.now()]
-   * @returns {{ count: number, remaining: number, resetTime: number, isExceeded: boolean }}
+   * @param ip - Client IP address
+   * @param now - Current timestamp
+   * @returns Current rate limit status
    */
-  get(ip, now = Date.now()) {
+  get(ip: string, now: number = Date.now()): RateLimitStatus {
     const cleanIp = normalizeIp(ip);
     const entry = this.records.get(cleanIp);
 
@@ -113,9 +124,9 @@ class RateLimiter {
 
   /**
    * Resets counter for a specific IP.
-   * @param {string} ip
+   * @param ip - Client IP address
    */
-  reset(ip) {
+  reset(ip: string): void {
     const cleanIp = normalizeIp(ip);
     this.records.delete(cleanIp);
   }
@@ -123,15 +134,14 @@ class RateLimiter {
   /**
    * Clears all tracked IP records from memory.
    */
-  clear() {
+  clear(): void {
     this.records.clear();
   }
 
   /**
    * Number of IPs currently stored in memory.
-   * @returns {number}
    */
-  get size() {
+  get size(): number {
     return this.records.size;
   }
 
@@ -139,10 +149,10 @@ class RateLimiter {
    * Scans and removes any expired counters from memory.
    * Because Map maintains insertion order, oldest entries are checked first.
    *
-   * @param {number} [now=Date.now()]
-   * @returns {number} Count of removed expired entries
+   * @param now - Current timestamp
+   * @returns Count of removed expired entries
    */
-  pruneExpired(now = Date.now()) {
+  pruneExpired(now: number = Date.now()): number {
     let pruned = 0;
     for (const [ip, entry] of this.records.entries()) {
       if (now >= entry.resetTime) {
@@ -155,32 +165,16 @@ class RateLimiter {
 
   /**
    * Evicts the oldest entry to maintain bounded memory.
-   * Prefers to evict an expired entry first; if none are expired, evicts the LRU entry.
+   * Evicts the least recently used entry to strictly uphold memory bound.
    *
-   * @private
-   * @param {number} now
+   * @param _now - Current timestamp
    */
-  _evictOldest(now) {
-    const iterator = this.records.entries();
-    const first = iterator.next().value;
+  private _evictOldest(_now: number): void {
+    const iterator = this.records.keys();
+    const firstKey = iterator.next().value;
 
-    if (!first) {
-      return;
+    if (firstKey !== undefined) {
+      this.records.delete(firstKey);
     }
-
-    const [oldestIp, oldestEntry] = first;
-
-    // If oldest is already expired, delete it
-    if (now >= oldestEntry.resetTime) {
-      this.records.delete(oldestIp);
-      return;
-    }
-
-    // Otherwise evict least recently used entry to strictly uphold memory bound
-    this.records.delete(oldestIp);
   }
 }
-
-module.exports = {
-  RateLimiter
-};
