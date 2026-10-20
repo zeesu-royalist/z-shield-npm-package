@@ -1,6 +1,6 @@
 # 🛡️ Z-Shield
 
-> Lightweight, zero-dependency API abuse detection, rate limiting, and security event logging toolkit for Node.js and Express backends.
+> Lightweight, zero-dependency API abuse detection, rate limiting, and security event logging toolkit for Node.js and Express backends by Zeesu Royalist.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Node.js](https://img.shields.io/badge/Node.js-%3E%3D18.0.0-green.svg)](https://nodejs.org)
