@@ -5,9 +5,10 @@ const assert = require('node:assert/strict');
 const http = require('node:http');
 const express = require('express');
 
-const { BlockManager, isValidIp, normalizeIp, canonicalizeIpv6, parseDuration } = require('../dist/block-manager');
+const { BlockManager, isValidIp, normalizeIp, canonicalizeIpv6, maskIpv6Subnet, parseDuration } = require('../dist/block-manager');
 const { RateLimiter } = require('../dist/rate-limiter');
 const { createShield, resolveConfig } = require('../dist/index');
+const { createNextShield } = require('../dist/next');
 
 describe('Z-Shield Phase 3: Protection Mode & Temporary IP Blocking', () => {
 
@@ -209,6 +210,73 @@ describe('Z-Shield Phase 3: Protection Mode & Temporary IP Blocking', () => {
 
       // Expanded representation is now also unblocked
       assert.equal(bm.isBlocked('2001:0db8:0000:0000:0000:0000:0000:0001'), false);
+    });
+
+    test('IPv6 /64 subnet masking zeroes host bits and preserves special addresses', () => {
+      // Global unicast addresses
+      assert.equal(maskIpv6Subnet('2001:db8:abcd:12:1:2:3:4'), '2001:db8:abcd:12::/64');
+      assert.equal(maskIpv6Subnet('2001:db8::1'), '2001:db8::/64');
+      assert.equal(maskIpv6Subnet('2001:0db8:85a3:0000:0000:8a2e:0370:7334'), '2001:db8:85a3::/64');
+      assert.equal(maskIpv6Subnet('2001:db8:0:1:2:3:4:5'), '2001:db8:0:1::/64');
+
+      // Already masked input
+      assert.equal(maskIpv6Subnet('2001:db8:abcd:12::/64'), '2001:db8:abcd:12::/64');
+
+      // Preserves IPv4
+      assert.equal(maskIpv6Subnet('192.168.1.1'), '192.168.1.1');
+      assert.equal(maskIpv6Subnet('10.0.0.1'), '10.0.0.1');
+
+      // Preserves loopback
+      assert.equal(maskIpv6Subnet('127.0.0.1'), '127.0.0.1');
+      assert.equal(maskIpv6Subnet('::1'), '127.0.0.1');
+
+      // Preserves IPv4-mapped IPv6
+      assert.equal(maskIpv6Subnet('::ffff:192.168.1.1'), '192.168.1.1');
+
+      // Preserves invalid or non-IP strings
+      assert.equal(maskIpv6Subnet('not-an-ip'), 'not-an-ip');
+      assert.equal(maskIpv6Subnet(''), 'unknown');
+    });
+
+    test('IPv6 addresses within the same /64 prefix share the same rate-limit bucket when enabled', () => {
+      // Default: maskIpv6Subnet is true
+      const limiter = new RateLimiter({ maxRequests: 3, windowMs: 60000, maskIpv6Subnet: true });
+      const now = 200000;
+
+      // 3 different host addresses within the exact same 2001:db8:abcd:12::/64 subnet
+      const r1 = limiter.record('2001:db8:abcd:12:1:2:3:1', now);
+      assert.equal(r1.count, 1);
+      assert.equal(r1.isExceeded, false);
+
+      const r2 = limiter.record('2001:db8:abcd:12:a:b:c:2', now);
+      assert.equal(r2.count, 2);
+      assert.equal(r2.isExceeded, false);
+
+      const r3 = limiter.record('2001:db8:abcd:12:ffff:0:0:9', now);
+      assert.equal(r3.count, 3);
+      assert.equal(r3.isExceeded, false);
+
+      // 4th request from another host in the same /64 subnet -> exceeds limit!
+      const r4 = limiter.record('2001:db8:abcd:12:0:0:0:1', now);
+      assert.equal(r4.count, 4);
+      assert.equal(r4.isExceeded, true);
+
+      // A request from a DIFFERENT subnet (e.g. 2001:db8:abcd:99::1) must have an independent bucket
+      const rOther = limiter.record('2001:db8:abcd:99::1', now);
+      assert.equal(rOther.count, 1);
+      assert.equal(rOther.isExceeded, false);
+    });
+
+    test('IPv6 addresses track distinct buckets when maskIpv6Subnet is disabled', () => {
+      const limiter = new RateLimiter({ maxRequests: 3, windowMs: 60000, maskIpv6Subnet: false });
+      const now = 300000;
+
+      // When maskIpv6Subnet is false, host 1 and host 2 each have independent counters
+      const r1 = limiter.record('2001:db8:abcd:12:1:2:3:1', now);
+      assert.equal(r1.count, 1);
+
+      const r2 = limiter.record('2001:db8:abcd:12:a:b:c:2', now);
+      assert.equal(r2.count, 1);
     });
 
     test('rejects blocking an invalid IP address', () => {
@@ -486,6 +554,95 @@ describe('Z-Shield Phase 3: Protection Mode & Temporary IP Blocking', () => {
       } finally {
         await new Promise(resolve => server.close(resolve));
       }
+    });
+
+    test('Unblock Trap regression: shield.unblock(ip) resets rate limiter counters and does not re-block on next request (Express)', async () => {
+      const app = express();
+      const shield = createShield({
+        mode: 'protect',
+        maxRequests: 2,
+        windowMs: 60000,
+        autoBlock: true,
+        blockDurationMs: 60000
+      });
+
+      app.use(shield.middleware);
+      app.get('/api/unblock-test', (req, res) => res.json({ status: 'ok' }));
+
+      const server = http.createServer(app);
+      await new Promise(resolve => server.listen(0, resolve));
+      const port = server.address().port;
+
+      try {
+        // Request 1: OK
+        const res1 = await fetch(`http://127.0.0.1:${port}/api/unblock-test`);
+        assert.equal(res1.status, 200);
+
+        // Request 2: OK (reaches maxRequests: 2)
+        const res2 = await fetch(`http://127.0.0.1:${port}/api/unblock-test`);
+        assert.equal(res2.status, 200);
+
+        // Request 3: exceeds rate limit -> returns 429 and auto-blocks 127.0.0.1
+        const res3 = await fetch(`http://127.0.0.1:${port}/api/unblock-test`);
+        assert.equal(res3.status, 429);
+        assert.equal(shield.isBlocked('127.0.0.1'), true);
+
+        // Administrator calls shield.unblock('127.0.0.1')
+        const unblocked = shield.unblock('127.0.0.1');
+        assert.equal(unblocked, true);
+        assert.equal(shield.isBlocked('127.0.0.1'), false);
+        // Rate limiter counter must be reset to 0
+        assert.equal(shield.rateLimiter.get('127.0.0.1').count, 0);
+
+        // Request 4 (the next request after unblock): must NOT be re-blocked! Must succeed with 200!
+        const res4 = await fetch(`http://127.0.0.1:${port}/api/unblock-test`);
+        assert.equal(res4.status, 200, 'Request immediately following shield.unblock() must succeed with 200 and not trigger re-block');
+        assert.equal(shield.isBlocked('127.0.0.1'), false);
+      } finally {
+        await new Promise(resolve => server.close(resolve));
+      }
+    });
+
+    test('Unblock Trap regression: nextShield.unblock(ip) resets rate limiter counters and does not re-block on next request (Next.js)', async () => {
+      const shield = createNextShield({
+        mode: 'protect',
+        maxRequests: 2,
+        windowMs: 60000,
+        autoBlock: true,
+        blockDurationMs: 60000
+      });
+
+      const handler = shield.protect(async () => new Response(JSON.stringify({ ok: true }), { status: 200 }));
+      const createReq = () => ({
+        url: 'http://localhost/api/test',
+        method: 'GET',
+        headers: {},
+        socket: { remoteAddress: '127.0.0.1' }
+      });
+
+      // Request 1: OK
+      const res1 = await handler(createReq());
+      assert.equal(res1.status, 200);
+
+      // Request 2: OK
+      const res2 = await handler(createReq());
+      assert.equal(res2.status, 200);
+
+      // Request 3: Exceeds limit -> 429 & autoBlocked
+      const res3 = await handler(createReq());
+      assert.equal(res3.status, 429);
+      assert.equal(shield.isBlocked('127.0.0.1'), true);
+
+      // Admin calls unblock
+      const unblocked = shield.unblock('127.0.0.1');
+      assert.equal(unblocked, true);
+      assert.equal(shield.isBlocked('127.0.0.1'), false);
+      assert.equal(shield.rateLimiter.get('127.0.0.1').count, 0);
+
+      // Request 4: Next request must succeed with 200 and not be re-blocked!
+      const res4 = await handler(createReq());
+      assert.equal(res4.status, 200, 'Next.js request immediately following unblock must succeed');
+      assert.equal(shield.isBlocked('127.0.0.1'), false);
     });
   });
 });

@@ -132,6 +132,7 @@ export class Logger {
   private _dirEnsured: boolean;
   private _pendingWrites: number;
   private _droppedEvents: number;
+  private _currentLogSizeBytes: number;
 
   /**
    * @param config - Logger options or resolved Z-Shield configuration
@@ -156,6 +157,7 @@ export class Logger {
     this._dirEnsured = false;
     this._pendingWrites = 0;
     this._droppedEvents = 0;
+    this._currentLogSizeBytes = -1;
   }
 
   /**
@@ -269,8 +271,11 @@ export class Logger {
     await this._rotateIfNeeded();
 
     const line = JSON.stringify(event) + '\n';
+    const lineBytes = Buffer.byteLength(line, 'utf8');
+
     try {
       await fs.promises.appendFile(this.filePath, line, { encoding: 'utf8', flag: 'a' });
+      this._currentLogSizeBytes += lineBytes;
     } catch (err: unknown) {
       // Self-healing recovery: if directory was removed externally right before write,
       // recreate directory and retry appending once before throwing.
@@ -279,8 +284,10 @@ export class Logger {
         await fs.promises.mkdir(this.logDir, { recursive: true });
         this._dirEnsured = true;
         await fs.promises.appendFile(this.filePath, line, { encoding: 'utf8', flag: 'a' });
+        this._currentLogSizeBytes = lineBytes;
         return;
       }
+      this._currentLogSizeBytes = -1;
       throw err;
     }
   }
@@ -297,18 +304,25 @@ export class Logger {
 
   /**
    * Checks file size and rotates log files if size exceeds maxLogSizeBytes.
+   * Uses cached in-memory size to avoid expensive disk stat operations on every single write.
    */
   private async _rotateIfNeeded(): Promise<void> {
-    try {
-      const stats = await fs.promises.stat(this.filePath);
-      if (stats.size < this.maxLogSizeBytes) {
-        return;
+    // If file size is not yet cached in memory (startup or recovery), stat once.
+    if (this._currentLogSizeBytes < 0) {
+      try {
+        const stats = await fs.promises.stat(this.filePath);
+        this._currentLogSizeBytes = stats.size;
+      } catch (err: unknown) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+          this._currentLogSizeBytes = 0;
+          return; // File does not exist yet
+        }
+        throw err;
       }
-    } catch (err: unknown) {
-      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-        return; // File does not exist yet
-      }
-      throw err;
+    }
+
+    if (this._currentLogSizeBytes < this.maxLogSizeBytes) {
+      return;
     }
 
     const { name, ext } = path.parse(this.logFilename);
@@ -320,6 +334,7 @@ export class Logger {
       } catch (err: unknown) {
         if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
       }
+      this._currentLogSizeBytes = 0;
       return;
     }
 
@@ -352,6 +367,9 @@ export class Logger {
     } catch (err: unknown) {
       if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
     }
+
+    // Reset in-memory size counter after rotation since new file will start fresh
+    this._currentLogSizeBytes = 0;
   }
 
   /**
@@ -364,6 +382,7 @@ export class Logger {
     // If the directory was deleted externally while running, reset _dirEnsured so the next
     // write attempt will automatically recreate the directory instead of failing permanently.
     this._dirEnsured = false;
+    this._currentLogSizeBytes = -1;
 
     if (this.onLogError) {
       try {

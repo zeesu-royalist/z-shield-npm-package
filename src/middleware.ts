@@ -95,19 +95,27 @@ export function isRouteExcluded(requestPath: string, excludeRoutes: readonly str
   }
 
   // Strip query string and fragment if present (e.g. from req.url)
-  const cleanPath = (requestPath || '/').split('?')[0]?.split('#')[0] ?? '/';
+  let cleanPath = (requestPath || '/').split('?')[0]?.split('#')[0] ?? '/';
+  // Normalize consecutive slashes (e.g. '//health', '/health///live')
+  cleanPath = cleanPath.replace(/\/+/g, '/');
+  if (!cleanPath.startsWith('/')) {
+    cleanPath = '/' + cleanPath;
+  }
 
   return excludeRoutes.some((route) => {
     if (typeof route !== 'string' || route.length === 0) {
       return false;
     }
 
-    if (route === '/') {
+    const normalizedRoute = route.replace(/\/+/g, '/');
+    if (normalizedRoute === '/') {
       return cleanPath === '/';
     }
 
     // Strip trailing slash from route prefix for normalized segment comparison
-    const normalizedPrefix = route.endsWith('/') ? route.slice(0, -1) : route;
+    const normalizedPrefix = normalizedRoute.endsWith('/') && normalizedRoute.length > 1
+      ? normalizedRoute.slice(0, -1)
+      : normalizedRoute;
 
     // Exact match (e.g. '/health' === '/health' or '/status' === '/status')
     if (cleanPath === normalizedPrefix) {

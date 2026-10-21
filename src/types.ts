@@ -27,6 +27,7 @@ export interface ZShieldOptions {
   maxLogFiles?: number;
   maxLogQueueSize?: number;
   onLogError?: ((err: Error, event: Record<string, unknown>) => void) | null;
+  maskIpv6Subnet?: boolean;
 }
 
 export interface ZShieldConfig {
@@ -47,6 +48,7 @@ export interface ZShieldConfig {
   readonly maxLogFiles: number;
   readonly maxLogQueueSize: number;
   readonly onLogError: ((err: Error, event: Record<string, unknown>) => void) | null;
+  readonly maskIpv6Subnet: boolean;
 }
 
 export interface RateLimitStatus {

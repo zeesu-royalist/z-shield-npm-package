@@ -530,6 +530,7 @@ export function createNextShield(
 
     unblock: (ip: string): boolean => {
       const result = blockManager.unblock(ip);
+      rateLimiter.reset(ip);
       if (result) {
         void logger.log({
           appName: config.appName,

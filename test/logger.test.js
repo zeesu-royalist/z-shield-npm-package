@@ -189,6 +189,45 @@ describe('Z-Shield Phase 4: Persistent Local JSONL Security Event Logging', () =
       // test-events.3.jsonl must NOT exist because maxLogFiles is 2
       assert.equal(fs.existsSync(rot3), false);
     });
+
+    test('logger size tracking rotates files accurately without calling stat on every line', async () => {
+      let statCalls = 0;
+      const originalStat = fs.promises.stat;
+      fs.promises.stat = async function (...args) {
+        statCalls++;
+        return originalStat.apply(this, args);
+      };
+
+      try {
+        const logger = new Logger({
+          logDir: tempDir,
+          logFilename: 'stat-opt-events.jsonl',
+          maxLogSizeBytes: 300,
+          maxLogFiles: 3
+        });
+
+        // Write 10 events
+        for (let i = 1; i <= 10; i++) {
+          await logger.log({
+            ip: '10.0.0.1',
+            route: `/stat/${i}`,
+            reason: `Testing in-memory size tracking event ${i}`
+          });
+        }
+
+        // With 10 writes, each line is ~170 bytes. The 300-byte threshold triggers multiple rotations.
+        // With in-memory size caching, fs.promises.stat is called only once on startup (to discover initial size).
+        // It is NOT called on every write!
+        assert.equal(statCalls, 1, `fs.promises.stat should only be called once, but was called ${statCalls} times`);
+
+        const baseFile = path.join(tempDir, 'stat-opt-events.jsonl');
+        const rot1 = path.join(tempDir, 'stat-opt-events.1.jsonl');
+        assert.equal(fs.existsSync(baseFile), true);
+        assert.equal(fs.existsSync(rot1), true);
+      } finally {
+        fs.promises.stat = originalStat;
+      }
+    });
   });
 
   describe('Failure Resilience & Concurrency', () => {

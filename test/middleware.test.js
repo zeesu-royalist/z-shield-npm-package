@@ -7,7 +7,7 @@ const path = require('node:path');
 const express = require('express');
 
 const { createShield, createMiddleware, resolveConfig, DEFAULT_CONFIG } = require('../dist/index');
-const { extractClientIp } = require('../dist/middleware');
+const { extractClientIp, isRouteExcluded } = require('../dist/middleware');
 
 describe('Z-Shield Phase 1: Configuration & Middleware Foundation', () => {
 
@@ -347,6 +347,40 @@ describe('Z-Shield Phase 1: Configuration & Middleware Foundation', () => {
       } finally {
         await new Promise(resolve => server.close(resolve));
       }
+    });
+
+    test('isRouteExcluded handles consecutive redundant slashes (//health, /health///live)', () => {
+      const excluded = ['/health', '/status/'];
+
+      // Consecutive leading slashes
+      assert.equal(isRouteExcluded('//health', excluded), true);
+      assert.equal(isRouteExcluded('///health', excluded), true);
+      assert.equal(isRouteExcluded('////health', excluded), true);
+
+      // Consecutive intermediate slashes
+      assert.equal(isRouteExcluded('/health///live', excluded), true);
+      assert.equal(isRouteExcluded('//health//ready', excluded), true);
+      assert.equal(isRouteExcluded('/status///ready', excluded), true);
+
+      // Trailing consecutive slashes
+      assert.equal(isRouteExcluded('/health//', excluded), true);
+      assert.equal(isRouteExcluded('//health//', excluded), true);
+
+      // Consecutive slashes with query string and fragment
+      assert.equal(isRouteExcluded('//health///live?check=1#top', excluded), true);
+
+      // Root slash with redundant slashes
+      assert.equal(isRouteExcluded('///', ['/']), true);
+      assert.equal(isRouteExcluded('//', ['/']), true);
+
+      // Boundary safety check: consecutive slashes must NOT match non-boundary routes
+      assert.equal(isRouteExcluded('//healthcare', excluded), false);
+      assert.equal(isRouteExcluded('///health-check', excluded), false);
+      assert.equal(isRouteExcluded('//status-page', excluded), false);
+
+      // Exclude route defined with redundant slashes
+      assert.equal(isRouteExcluded('/health', ['//health']), true);
+      assert.equal(isRouteExcluded('/health/live', ['//health//']), true);
     });
 
     test('handles request safely when headers have already been sent by upstream middleware', async () => {

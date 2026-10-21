@@ -55,7 +55,10 @@ export const DEFAULT_CONFIG: ZShieldConfig = {
   maxLogQueueSize: 1000,
 
   // Optional custom error callback: (err, event) => void
-  onLogError: null
+  onLogError: null,
+
+  // Whether to mask global unicast IPv6 addresses to /64 subnet prefixes for rate limiting
+  maskIpv6Subnet: true
 };
 
 /**
@@ -170,6 +173,11 @@ export function resolveConfig(userConfig: ZShieldOptions | ZShieldConfig = {}): 
   // Validate onLogError
   if (rawConfig.onLogError !== null && typeof rawConfig.onLogError !== 'function') {
     throw new TypeError('[Z-Shield] "onLogError" must be null or a function.');
+  }
+
+  // Validate maskIpv6Subnet
+  if (typeof rawConfig.maskIpv6Subnet !== 'boolean') {
+    throw new TypeError('[Z-Shield] "maskIpv6Subnet" must be a boolean (true or false).');
   }
 
   // Freeze the object so application code cannot accidentally mutate it at runtime

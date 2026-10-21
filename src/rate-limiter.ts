@@ -5,6 +5,7 @@ export interface RateLimiterOptions {
   windowMs?: number;
   maxRequests?: number;
   maxTrackedIps?: number;
+  maskIpv6Subnet?: boolean;
 }
 
 interface CounterEntry {
@@ -30,6 +31,7 @@ export class RateLimiter {
   readonly windowMs: number;
   readonly maxRequests: number;
   readonly maxTrackedIps: number;
+  readonly maskIpv6Subnet: boolean;
   private readonly records: Map<string, CounterEntry>;
 
   /**
@@ -39,6 +41,7 @@ export class RateLimiter {
     this.windowMs = options.windowMs || 60000;
     this.maxRequests = options.maxRequests || 100;
     this.maxTrackedIps = options.maxTrackedIps || 10000;
+    this.maskIpv6Subnet = options.maskIpv6Subnet !== undefined ? Boolean(options.maskIpv6Subnet) : true;
 
     this.records = new Map<string, CounterEntry>();
   }
@@ -51,7 +54,7 @@ export class RateLimiter {
    * @returns Current rate limit status
    */
   record(ip: string, now: number = Date.now()): RateLimitStatus {
-    const cleanIp = normalizeIp(ip);
+    const cleanIp = normalizeIp(ip, this.maskIpv6Subnet);
 
     let entry = this.records.get(cleanIp);
 
@@ -102,7 +105,7 @@ export class RateLimiter {
    * @returns Current rate limit status
    */
   get(ip: string, now: number = Date.now()): RateLimitStatus {
-    const cleanIp = normalizeIp(ip);
+    const cleanIp = normalizeIp(ip, this.maskIpv6Subnet);
     const entry = this.records.get(cleanIp);
 
     if (!entry || now >= entry.resetTime) {
@@ -127,7 +130,7 @@ export class RateLimiter {
    * @param ip - Client IP address
    */
   reset(ip: string): void {
-    const cleanIp = normalizeIp(ip);
+    const cleanIp = normalizeIp(ip, this.maskIpv6Subnet);
     this.records.delete(cleanIp);
   }
 

@@ -3,7 +3,7 @@ import { createNextShield, withNextShield, extractNextClientIp } from './next';
 import { resolveConfig, DEFAULT_CONFIG } from './config';
 import { RateLimiter } from './rate-limiter';
 import { Detector } from './detector';
-import { BlockManager, isValidIp, normalizeIp, canonicalizeIpv6, parseDuration, type BlockInfo } from './block-manager';
+import { BlockManager, isValidIp, normalizeIp, canonicalizeIpv6, maskIpv6Subnet, parseDuration, type BlockInfo } from './block-manager';
 import { Logger, stripAnsi, sanitizeString, sanitizeRoute, sanitizeMethod } from './logger';
 import type {
   ZShieldConfig,
@@ -69,6 +69,7 @@ export function createShield(options: ZShieldOptions | ZShieldConfig = {}): ZShi
 
     unblock: (ip: string): boolean => {
       const result = blockManager.unblock(ip);
+      rateLimiter.reset(ip);
       if (result) {
         void logger.log({
           appName: config.appName,
@@ -104,6 +105,7 @@ export {
   isValidIp,
   normalizeIp,
   canonicalizeIpv6,
+  maskIpv6Subnet,
   parseDuration,
   Logger,
   stripAnsi,

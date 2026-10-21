@@ -21,18 +21,17 @@ interface InternalBlockEntry {
 }
 
 /**
- * Canonicalizes an IPv6 address string according to RFC 5952.
- * - Parses 16-bit hextets
- * - Handles embedded IPv4 in IPv6 (including IPv4-mapped IPv6)
- * - Normalizes loopback ('::1' and '0:0:0:0:0:0:0:1') to '127.0.0.1'
- * - Normalizes IPv4-mapped addresses to standard IPv4
- * - Compresses the longest run of 2 or more zeros with '::' (first run on tie)
- * - Lowers all hexadecimal characters and removes leading zeros in each field
+ * Parses an IPv6 address string into its 8 16-bit hextets.
  *
- * @param ip - Valid IPv6 address string
- * @returns Canonicalized representation
+ * @param ip - Valid IPv6 candidate string
+ * @returns Parsed hextets and metadata, or null if invalid
  */
-export function canonicalizeIpv6(ip: string): string {
+export function parseIpv6Hextets(ip: string): {
+  hextets: number[];
+  isIpv4Mapped: boolean;
+  isLoopback: boolean;
+  ipv4MappedAddress?: string;
+} | null {
   let str = ip.toLowerCase().trim();
   const zoneIndex = str.indexOf('%');
   if (zoneIndex !== -1) {
@@ -49,14 +48,14 @@ export function canonicalizeIpv6(ip: string): string {
         embeddedIpv4 = candidateIpv4.split('.').map(Number);
         str = str.substring(0, lastColon) + ':0:0';
       } else {
-        return ip.toLowerCase().trim();
+        return null;
       }
     }
   }
 
   const parts = str.split('::');
   if (parts.length > 2) {
-    return ip.toLowerCase().trim();
+    return null;
   }
 
   const head = parts[0] ? parts[0].split(':').filter(Boolean) : [];
@@ -64,10 +63,10 @@ export function canonicalizeIpv6(ip: string): string {
 
   const totalHextets = head.length + tail.length;
   if (parts.length === 1 && totalHextets !== 8) {
-    return ip.toLowerCase().trim();
+    return null;
   }
   if (parts.length === 2 && totalHextets >= 8) {
-    return ip.toLowerCase().trim();
+    return null;
   }
 
   const missingZeros = 8 - totalHextets;
@@ -76,7 +75,7 @@ export function canonicalizeIpv6(ip: string): string {
   for (const h of head) {
     const val = parseInt(h, 16);
     if (isNaN(val) || val < 0 || val > 0xffff) {
-      return ip.toLowerCase().trim();
+      return null;
     }
     hextets.push(val);
   }
@@ -86,13 +85,13 @@ export function canonicalizeIpv6(ip: string): string {
   for (const t of tail) {
     const val = parseInt(t, 16);
     if (isNaN(val) || val < 0 || val > 0xffff) {
-      return ip.toLowerCase().trim();
+      return null;
     }
     hextets.push(val);
   }
 
   if (hextets.length !== 8) {
-    return ip.toLowerCase().trim();
+    return null;
   }
 
   if (embeddedIpv4 && embeddedIpv4.length === 4) {
@@ -108,6 +107,8 @@ export function canonicalizeIpv6(ip: string): string {
     hextets[3] === 0 &&
     hextets[4] === 0 &&
     hextets[5] === 0xffff;
+
+  let ipv4MappedAddress: string | undefined;
   if (isIpv4Mapped) {
     const h6 = hextets[6] ?? 0;
     const h7 = hextets[7] ?? 0;
@@ -115,15 +116,22 @@ export function canonicalizeIpv6(ip: string): string {
     const b1 = h6 & 0xff;
     const b2 = (h7 >> 8) & 0xff;
     const b3 = h7 & 0xff;
-    return `${b0}.${b1}.${b2}.${b3}`;
+    ipv4MappedAddress = `${b0}.${b1}.${b2}.${b3}`;
   }
 
   // IPv6 Loopback: ::1 or 0:0:0:0:0:0:0:1 -> 127.0.0.1
   const isLoopback = hextets.slice(0, 7).every((h) => h === 0) && hextets[7] === 1;
-  if (isLoopback) {
-    return '127.0.0.1';
-  }
 
+  return { hextets, isIpv4Mapped, isLoopback, ipv4MappedAddress };
+}
+
+/**
+ * Formats 8 16-bit hextets into a canonical RFC 5952 IPv6 string.
+ *
+ * @param hextets - Array of 8 hextet numbers (0x0000 - 0xffff)
+ * @returns Canonical RFC 5952 representation
+ */
+export function formatCanonicalIpv6(hextets: number[]): string {
   // Find longest contiguous run of zeros (length >= 2) under RFC 5952
   let bestStart = -1;
   let bestLen = 0;
@@ -159,23 +167,128 @@ export function canonicalizeIpv6(ip: string): string {
 }
 
 /**
+ * Canonicalizes an IPv6 address string according to RFC 5952.
+ * - Parses 16-bit hextets
+ * - Handles embedded IPv4 in IPv6 (including IPv4-mapped IPv6)
+ * - Normalizes loopback ('::1' and '0:0:0:0:0:0:0:1') to '127.0.0.1'
+ * - Normalizes IPv4-mapped addresses to standard IPv4
+ * - Compresses the longest run of 2 or more zeros with '::' (first run on tie)
+ * - Lowers all hexadecimal characters and removes leading zeros in each field
+ *
+ * @param ip - Valid IPv6 address string
+ * @returns Canonicalized representation
+ */
+export function canonicalizeIpv6(ip: string): string {
+  const parsed = parseIpv6Hextets(ip);
+  if (!parsed) {
+    return ip.toLowerCase().trim();
+  }
+  if (parsed.isIpv4Mapped && parsed.ipv4MappedAddress) {
+    return parsed.ipv4MappedAddress;
+  }
+  if (parsed.isLoopback) {
+    return '127.0.0.1';
+  }
+  return formatCanonicalIpv6(parsed.hextets);
+}
+
+/**
+ * Masks the host bits (last 64 bits / 4 hextets) of global unicast IPv6 addresses,
+ * producing a canonical /64 subnet prefix (e.g., '2001:db8:abcd:12:1:2:3:4' -> '2001:db8:abcd:12::/64').
+ * Preserves IPv4 addresses, loopback ('127.0.0.1'), and IPv4-mapped IPv6 addresses.
+ *
+ * @param canonicalIpv6 - Valid IPv6 address or normalized IP string
+ * @returns Masked /64 subnet prefix or preserved original IP
+ */
+export function maskIpv6Subnet(canonicalIpv6: string): string {
+  if (typeof canonicalIpv6 !== 'string') {
+    return 'unknown';
+  }
+  const trimmed = canonicalIpv6.trim();
+  if (trimmed.length === 0) {
+    return 'unknown';
+  }
+
+  // Already masked /64 subnet
+  if (trimmed.endsWith('/64')) {
+    return trimmed;
+  }
+
+  // Preserved IPv4 loopback or standard loopback
+  if (trimmed === '127.0.0.1' || trimmed === '::1') {
+    return '127.0.0.1';
+  }
+
+  // Preserved standard IPv4
+  if (net.isIP(trimmed) === 4) {
+    return trimmed;
+  }
+
+  // Parse IPv6 hextets
+  const parsed = parseIpv6Hextets(trimmed);
+  if (!parsed) {
+    return trimmed;
+  }
+
+  // Preserve IPv4-mapped IPv6
+  if (parsed.isIpv4Mapped && parsed.ipv4MappedAddress) {
+    return parsed.ipv4MappedAddress;
+  }
+
+  // Preserve loopback
+  if (parsed.isLoopback) {
+    return '127.0.0.1';
+  }
+
+  // Preserve unspecified address ::
+  if (parsed.hextets.every((h) => h === 0)) {
+    return '::';
+  }
+
+  // For global unicast and other IPv6 addresses:
+  // Zero out host bits (hextets 4, 5, 6, 7)
+  const maskedHextets = [
+    parsed.hextets[0] ?? 0,
+    parsed.hextets[1] ?? 0,
+    parsed.hextets[2] ?? 0,
+    parsed.hextets[3] ?? 0,
+    0,
+    0,
+    0,
+    0
+  ];
+
+  const canonicalPrefix = formatCanonicalIpv6(maskedHextets);
+  return `${canonicalPrefix}/64`;
+}
+
+/**
  * Normalizes an IP address for consistent comparison across IPv4 and IPv6.
  * - Trims whitespace
  * - Canonicalizes IPv6 addresses according to RFC 5952 (zero compression, lowercase)
+ * - Optionally masks IPv6 addresses to /64 subnet prefixes for rate-limiting
  * - Unmaps all IPv4-mapped IPv6 variations (e.g. '::ffff:192.168.1.1' -> '192.168.1.1')
  * - Normalizes all IPv6 loopback variants ('::1', '0:0:0:0:0:0:0:1') to '127.0.0.1'
  * - Preserves invalid strings without converting them into fake valid IPs
  *
  * @param ip - Raw client IP candidate
+ * @param maskSubnet - Whether to group global unicast IPv6 into /64 subnets
  * @returns Normalized IP or 'unknown'
  */
-export function normalizeIp(ip: unknown): string {
+export function normalizeIp(ip: unknown, maskSubnet: boolean = false): string {
   if (typeof ip !== 'string') {
     return 'unknown';
   }
   const trimmed = ip.trim();
   if (trimmed.length === 0) {
     return 'unknown';
+  }
+
+  // Already masked IPv6 subnet prefix
+  if (trimmed.endsWith('/64')) {
+    const candidatePrefix = trimmed.slice(0, -3);
+    const candidateCanon = canonicalizeIpv6(candidatePrefix);
+    return maskIpv6Subnet(candidateCanon);
   }
 
   // Standard valid IPv4
@@ -186,7 +299,11 @@ export function normalizeIp(ip: unknown): string {
 
   // Standard valid IPv6 (including loopback and IPv4-mapped)
   if (ipType === 6) {
-    return canonicalizeIpv6(trimmed);
+    const canonical = canonicalizeIpv6(trimmed);
+    if (maskSubnet) {
+      return maskIpv6Subnet(canonical);
+    }
+    return canonical;
   }
 
   // Handle possible ::ffff:192.0.2.1 where net.isIP might return 0
